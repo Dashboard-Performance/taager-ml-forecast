@@ -36,15 +36,21 @@ python src/train.py                 # fetch live from the sheet
 python src/train.py --local hist.csv  # or use a local pivot CSV
 ```
 
-## First measured result (Jan–Jul 2026, confirmed pieces, walk-forward)
-Accuracy = 1 − WAPE, vs simply repeating last month (naive):
+## Measured result (Oct 2026, same data as the dashboard)
+Compared head-to-head against the dashboard's Forecast Model on the same 1,818
+single SKUs (bundles split) and the same months (May-Sep 2026), accuracy = 1 - WAPE:
 
-| Segment | ML | Naive | ML − Naive |
+| Segment | Dashboard | This ML | Last month (naive) |
 |---|---|---|---|
-| A (≥100/mo) | 43.3% | 36.7% | +6.6 |
-| B (30–99)   | 15.7% | 10.4% | +5.3 |
-| C (<30)     |  4.1% |  0.5% | +3.6 |
+| All | 53.8% | 38.6% | 41.2% |
+| A (100+) | 60.4% | 43.9% | 47.9% |
+| B (30-99) | 26.4% | 15.0% | 8.8% |
+| C (<30) | 9.4% | 4.2% | -0.2% |
 
-ML beats naive on every segment. It is **not yet** compared head-to-head against the
-dashboard's tuned engine (TSB + blend) — that comparison is the gate before wiring
-the ML into the live Forecast Model. Accuracy grows as more months accumulate.
+The ML beats "last month" on B and C but is behind the dashboard everywhere, and
+averaging the two (50.8%) is worse than the dashboard alone. Keep it in shadow mode.
+
+> Note: the history tab is `Data Jan-July` (gid 1433599782, the dashboard's
+> FORECAST_HISTORY_GID). Google serves the *first* sheet when a gid does not exist,
+> so `train.py` now checks the column names and stops with an error instead of
+> silently training on the wrong tab. It also drops a partial last month.

@@ -29,8 +29,7 @@ import sys, os, json, csv, io, datetime
 import numpy as np
 
 SHEET_ID = "1Vg8P1EL5y_FqQSR7_uDI1XtB-gDe0Bkj7IqbiOzNgxA"
-HISTORY_GID = "1338407774"           # "Forecast History" tab
-N_MONTHS = 7                          # months present in history (grows over time; auto-detected on live)
+HISTORY_GID = "1433599782"           # "Data Jan-July" tab = the dashboard's FORECAST_HISTORY_GID (daily history)
 SEG_A, SEG_B = 100, 30                # monthly-confirmed thresholds: A>=100, B 30-99, C<30
 
 # ------------------------------------------------------------------ data load
@@ -42,12 +41,33 @@ def _gviz(tq):
     s = raw.find("("); e = raw.rfind(")")
     return json.loads(raw[s + 1:e])
 
+def _check_history_tab():
+    """Fail loudly if the tab is not the daily history. Google's gviz silently
+    serves the FIRST sheet when the gid does not exist, which would train the
+    model on the wrong data without any error."""
+    resp = _gviz("select * limit 1")
+    labels = [(c.get("label") or c.get("id") or "").strip().upper() for c in resp["table"]["cols"]]
+    need = {"PERIOD_FILTER", "PRODUCT_ID", "PLACED_PIECES", "CONFIRMED_PIECES", "DELIVERED_PIECES"}
+    if not need.issubset(set(labels)):
+        raise SystemExit("HISTORY_GID %s is not the daily history tab (columns seen: %s)" % (HISTORY_GID, labels[:12]))
+    for letter, name in (("A", "PERIOD_FILTER"), ("D", "PRODUCT_ID"), ("P", "PLACED_PIECES"), ("Q", "CONFIRMED_PIECES"), ("R", "DELIVERED_PIECES")):
+        if labels[ord(letter) - 65] != name:
+            raise SystemExit("Column %s is %r, expected %s - the sheet layout changed" % (letter, labels[ord(letter) - 65], name))
+
 def load_live():
-    """Pivot to {pid: {'c':[..],'p':[..],'r':[..]}} of monthly confirmed/placed/delivered."""
+    """Pivot to {pid: {'p':[..],'q':[..],'r':[..]}} of monthly placed/confirmed/delivered.
+    Only COMPLETE months are used: a month whose last data day is before the
+    end of that month is dropped, so the model never trains on a half month."""
+    _check_history_tab()
     resp = _gviz("select D, year(A), month(A), sum(P), sum(Q), sum(R) group by D, year(A), month(A) order by year(A), month(A)")
     rows = resp["table"]["rows"]
-    # map (year,month) -> column index, oldest first
+    last = _gviz("select max(A)")["table"]["rows"][0]["c"][0]
+    v = last["v"]                                              # gviz date: "Date(y,m,d)", month 0-based
+    y, mth, d = [int(x) for x in v[5:-1].split(",")]          # month is 0-based
+    import calendar
+    last_complete = (y, mth) if d >= calendar.monthrange(y, mth + 1)[1] else (y, mth - 1) if mth > 0 else (y - 1, 11)
     ym = sorted({(r["c"][1]["v"], r["c"][2]["v"]) for r in rows if r["c"][1] and r["c"][2]})
+    ym = [k for k in ym if k <= last_complete]
     idx = {k: i for i, k in enumerate(ym)}
     n = len(ym)
     M = {}
@@ -55,6 +75,8 @@ def load_live():
         c = r["c"]
         pid = c[0]["v"] if c[0] else None
         if not pid or c[1] is None or c[2] is None:
+            continue
+        if (c[1]["v"], c[2]["v"]) not in idx:
             continue
         j = idx[(c[1]["v"], c[2]["v"])]
         e = M.setdefault(pid, {"p": [0]*n, "q": [0]*n, "r": [0]*n})
