@@ -1,0 +1,35 @@
+name: ML Forecast
+
+# Every day at 03:15 Cairo (01:15 UTC; 04:15 in summer time). The run on the 1st freezes the number for that month.
+on:
+  schedule:
+    - cron: "15 1 * * *"
+  workflow_dispatch:
+    inputs:
+      lock_month:
+        description: "Only if a lock was missed: re-create the frozen forecast of this month (YYYY-MM). Leave empty for a normal run."
+        required: false
+
+concurrency: ml-forecast
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # a model that fails its own tests never publishes
+      - run: python tests/test_all.py
+      - name: Run the model and publish to the dashboard Worker
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+          LOCK_MONTH: ${{ inputs.lock_month }}
+        run: |
+          if [ -n "$LOCK_MONTH" ]; then python run.py --worker "$WORKER_URL" --key "$SERVICE_KEY" --lock-month "$LOCK_MONTH";
+          else python run.py --worker "$WORKER_URL" --key "$SERVICE_KEY"; fi
