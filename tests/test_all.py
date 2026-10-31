@@ -117,5 +117,17 @@ W = data.Worker("http://127.0.0.1:%d" % srv.server_port, "k")
 c1, r1 = W.put("locked", {"month": "2026-11", "rows": {}}, "2026-11"); c2, r2 = W.put("locked", {"month": "2026-11", "rows": {"x": 1}}, "2026-11")
 ok("Worker client: first lock accepted, second refused with 409 (and parsed, not raised)", c1 == 200 and c2 == 409)
 ok("Worker client: lists and reads locked months, 404 -> None", W.get(lst=True)["months"] == ["2026-11"] and W.get(month="2026-11")["month"] == "2026-11" and W.get(month="2025-01") is None)
-srv.shutdown()
+seen = {}
+class H2(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        seen["ua"] = self.headers.get("User-Agent")
+        b = b'{"success":false,"message":"nope"}'; self.send_response(403); self.end_headers(); self.wfile.write(b)
+srv2 = http.server.HTTPServer(("127.0.0.1", 0), H2); threading.Thread(target=srv2.serve_forever, daemon=True).start()
+try:
+    data.Worker("http://127.0.0.1:%d" % srv2.server_port, "k").source("1"); ok("an HTTP error is raised", False)
+except RuntimeError as e:
+    ok("an HTTP error says what the server answered (status + body), not just the number", "403" in str(e) and "nope" in str(e))
+ok("every request carries our own User-Agent (Cloudflare blocks Python's default one)", seen["ua"].startswith("taager-ml-forecast/"))
+srv2.shutdown(); srv.shutdown()
 print("\n%d passed" % n_pass)

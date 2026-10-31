@@ -23,11 +23,13 @@ def main():
         if not a.worker or not a.key: sys.exit("--worker and --key are required (or use --demo)")
         W = data.Worker(a.worker, a.key)
         today = pd.Timestamp(dt.date.today())
-        hist = data.fetch_history(pd.Timestamp(a.since), today)
+        # the Worker first: if the key or the URL is wrong we find out in seconds, not after the long history download
         newer = data.product_only_daily(data.parse_table(W.source(data.GID_PRODUCT_ONLY)))
         dmap = data.debundle_map(data.parse_table(W.source(data.GID_DEBUNDLE)))
         try: cats = data.category_map(data.parse_table(W.source(data.GID_PRODUCTS)))
         except Exception as e: print("categories unavailable:", e); cats = None
+        print("Worker sources ok: Product Only %d rows, %d bundles mapped" % (len(newer), len(dmap)), flush=True)
+        hist = data.fetch_history(pd.Timestamp(a.since), today)
         prices = data.fetch_prices()
         checks = {"overlap": data.overlap_check(hist, newer), "prices": prices is not None, "categories": bool(cats)}
         cairo_today = pd.Timestamp.now(tz="Africa/Cairo").tz_localize(None).normalize()

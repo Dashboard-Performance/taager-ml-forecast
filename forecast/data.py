@@ -35,10 +35,24 @@ class Panel:
 
 
 # --------------------------------------------------------------------------- fetching
+UA = "taager-ml-forecast/2.0 (+https://github.com/Dashboard-Performance/taager-ml-forecast)"   # Cloudflare answers 403 to Python's default User-Agent
+
+
+class HttpError(RuntimeError):
+    def __init__(self, code, msg): super().__init__(msg); self.code = code
+
+
 def _http(url, headers=None, data=None, timeout=240):
-    req = urllib.request.Request(url, headers=headers or {}, data=data)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+    h = {"User-Agent": UA}; h.update(headers or {})
+    req = urllib.request.Request(url, headers=h, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:     # say WHAT the server answered, not just the number
+        body = ""
+        try: body = e.read().decode("utf-8", "replace")[:300]
+        except Exception: pass
+        raise HttpError(e.code, "HTTP %s from %s -> %s" % (e.code, url.split("?")[0] + "?" + (url.split("?")[1].split("&")[0] if "?" in url else ""), body)) from None
 
 
 class Worker:
@@ -51,7 +65,7 @@ class Worker:
     def put(self, kind, payload, month=None):
         q = "action=mlPut&kind=%s" % kind + ("&month=%s" % month if month else "")
         req = urllib.request.Request("%s/?%s" % (self.base, q), data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-                                     headers=dict(self._h(), **{"Content-Type": "application/json"}), method="POST")
+                                     headers=dict(self._h(), **{"Content-Type": "application/json", "User-Agent": UA}), method="POST")
         try:
             with urllib.request.urlopen(req, timeout=240) as r:
                 return r.status, json.loads(r.read().decode("utf-8"))
@@ -61,7 +75,7 @@ class Worker:
         q = "action=mlGet" + ("&list=1" if lst else ("&month=%s" % month if month else ""))
         try:
             return json.loads(_http("%s/?%s" % (self.base, q), self._h()))
-        except urllib.error.HTTPError as e:
+        except HttpError as e:
             if e.code == 404: return None
             raise
 
