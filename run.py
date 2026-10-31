@@ -23,22 +23,22 @@ def main():
         if not a.worker or not a.key: sys.exit("--worker and --key are required (or use --demo)")
         W = data.Worker(a.worker, a.key)
         today = pd.Timestamp(dt.date.today())
-        # the Worker first: if the key or the URL is wrong we find out in seconds, not after the long history download
-        newer = data.product_only_daily(data.parse_table(W.source(data.GID_PRODUCT_ONLY)))
+        # ONE source for the recent days: Main (the Matches query) - the same columns as the history tab. Worker first, so a wrong key / URL shows up in seconds.
+        newer = data.main_long(W.source(data.GID_MAIN))
         dmap = data.debundle_map(data.parse_table(W.source(data.GID_DEBUNDLE)))
-        try: cats = data.category_map(data.parse_table(W.source(data.GID_PRODUCTS)))
-        except Exception as e: print("categories unavailable:", e); cats = None
-        print("Worker sources ok: Product Only %d rows, %d bundles mapped" % (len(newer), len(dmap)), flush=True)
-        hist = data.fetch_history(pd.Timestamp(a.since), today)
-        prices = data.fetch_prices()
-        checks = {"overlap": data.overlap_check(hist, newer), "prices": prices is not None, "categories": bool(cats)}
+        try: bi = data.beginning_inventory(data.parse_table(W.source(data.GID_BEGIN_INV)))
+        except Exception as e: print("beginning inventory unavailable:", e); bi = None
+        print("Worker sources ok: Main %d rows (%s .. %s), %d bundles mapped" % (len(newer), newer["date"].min().date(), newer["date"].max().date(), len(dmap)), flush=True)
+        hist = data.fetch_history_long(pd.Timestamp(a.since), today)
+        inbound = data.fetch_inbound(); prices = data.fetch_prices()
+        checks = {"overlap": data.overlap_check(hist, newer), "source": "Main + history tab", "prices": prices is not None, "inbound": inbound is not None, "beginInventory": bool(bi)}
         cairo_today = pd.Timestamp.now(tz="Africa/Cairo").tz_localize(None).normalize()
         dmax = max(x["date"].max() for x in (hist, newer) if x is not None and len(x))
         asof = data.pick_asof(cairo_today, dmax)
         if asof < cairo_today - pd.Timedelta(days=1): checks["stale"] = "data stops at %s" % dmax.date()
         if a.lock_month:   # replay the day before that month started
             m = pd.Period(a.lock_month, "M"); asof = (m.start_time - pd.Timedelta(days=1)).normalize()
-        panel = data.build_panel(hist, newer, dmap, cats, prices, as_of=asof)
+        panel = data.build_panel(hist, newer, dmap, None, prices, as_of=asof, inbound=inbound, bi=bi)
     locked = {}
     if W is not None:
         for m in (W.get(lst=True) or {}).get("months", []):

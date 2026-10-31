@@ -10,7 +10,8 @@ from .features import FEATURES
 
 BASELINES = ["naive", "ma3", "pace14", "pace30", "pace_mtd"]
 GBMS = ["gbm_l1", "gbm_tw", "gbm_log"]
-CANDIDATES = BASELINES + GBMS + ["ens"]
+CANDIDATES = BASELINES + GBMS + ["ens", "gbm_l1_cal", "ens_cal"]
+CAL_BASES = ("gbm_l1", "ens")
 PARAMS = dict(n_estimators=300, learning_rate=0.04, num_leaves=31, min_child_samples=40, subsample=0.8, subsample_freq=1,
               colsample_bytree=0.8, reg_lambda=1.0, random_state=7, n_jobs=2, verbose=-1, deterministic=True, force_row_wise=True)
 MIN_TRAIN_ROWS = 300

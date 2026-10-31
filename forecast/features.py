@@ -11,6 +11,9 @@ FEATURES = [
     "r3", "r7", "r14", "r30", "r60", "r90", "r7_r30", "r14_r60", "r30_r90", "mtdrr_m1", "r14m_m1",
     "slope30", "cv30", "zero30", "maxshare30", "cr14", "dr_mature", "age_days", "since_sale", "nz_months6", "scale",
     "p_chg30", "p_chg90", "cat",
+    "nm1", "nm2", "nm_chg", "top1_1", "hhi_1", "ret_1", "nm_mtd", "nm14", "top1_mtd", "new_mtd",
+    "inb30", "inb90", "inb_mtd", "since_inb", "inb30_m1", "bi_c", "bi_cover", "avail_pace",
+    "miss_pace1", "miss_pace2", "miss_ma3_1",
 ]
 
 
@@ -45,6 +48,93 @@ def origin_info(dates, o):
     C = day.to_period("M"); M = C + 1
     return {"C": C, "M": M, "d": int(day.day), "len_c": int(C.days_in_month), "len_m": int(M.days_in_month),
             "c_first": C.start_time.normalize(), "c_last": C.end_time.normalize(), "m_first": M.start_time.normalize(), "m_last": M.end_time.normalize()}
+
+
+
+# ---------------------------------------------------------------- merchants (who sells the SKU)
+def _mrows(panel, a, b):
+    """merchant rows for day indexes a..b inclusive -> (sku_idx, merchant_code, pieces)"""
+    di, si, mc, q = panel.merch
+    lo = int(np.searchsorted(di, a, "left")); hi = int(np.searchsorted(di, b, "right"))
+    return si[lo:hi], mc[lo:hi], q[lo:hi]
+
+
+def _per_sku_merchant(panel, a, b):
+    """pieces per (sku, merchant) between day indexes a..b -> (keys, pieces) with key = sku * 1e7 + merchant"""
+    key = ("pm", a, b)
+    if key in panel._cache: return panel._cache[key]
+    si, mc, q = _mrows(panel, a, b)
+    if len(si) == 0:
+        res = (np.array([], dtype=np.int64), np.array([]))
+    else:
+        k = si * 10_000_000 + mc
+        u, inv = np.unique(k, return_inverse=True)
+        res = (u, np.bincount(inv, weights=q))
+    panel._cache[key] = res
+    return res
+
+
+def _month_merchants(panel, pm, S):
+    """for one complete month: number of merchants, share of the biggest one, concentration (HHI) per SKU"""
+    keys, pcs = _per_sku_merchant(panel, *pm)
+    n = np.zeros(S); top = np.zeros(S); tot = np.zeros(S); hhi = np.zeros(S)
+    if len(keys):
+        sk = keys // 10_000_000
+        pos = pcs > 0
+        sk, pc = sk[pos], pcs[pos]
+        n = np.bincount(sk, minlength=S).astype(float)
+        tot = np.bincount(sk, weights=pc, minlength=S)
+        order = np.lexsort((pc, sk)); sk_o, pc_o = sk[order], pc[order]
+        last = np.r_[sk_o[1:] != sk_o[:-1], True]
+        top[sk_o[last]] = pc_o[last]
+        hhi = np.bincount(sk, weights=(pc / np.maximum(tot[sk], EPS)) ** 2, minlength=S)
+    share = np.where(tot > 0, top / np.maximum(tot, EPS), np.nan)
+    return n, share, np.where(tot > 0, hhi, np.nan), tot
+
+
+def merchant_features(panel, o, info, S):
+    f = {k: np.full(S, np.nan) for k in ("nm1", "nm2", "nm_chg", "top1_1", "hhi_1", "ret_1", "nm_mtd", "nm14", "top1_mtd", "new_mtd")}
+    if panel.merch is None: return f
+    dates = panel.dates
+    def bounds(k):
+        pm = info["C"] - k; s_, e_ = pm.start_time.normalize(), pm.end_time.normalize()
+        if s_ < dates[0] or e_ > dates[o]: return None
+        return int((s_ - dates[0]).days), int((e_ - dates[0]).days)
+    b1, b2 = bounds(1), bounds(2)
+    if b1:
+        n1, sh1, hh1, tot1 = _month_merchants(panel, b1, S)
+        f["nm1"], f["top1_1"], f["hhi_1"] = n1, sh1, hh1
+        if b2:
+            n2, _, _, _ = _month_merchants(panel, b2, S)
+            f["nm2"] = n2; f["nm_chg"] = np.where(n2 > 0, n1 / np.maximum(n2, 1), np.nan)
+            k1, p1 = _per_sku_merchant(panel, *b1); k2, _ = _per_sku_merchant(panel, *b2)
+            if len(k1):
+                kept = np.isin(k1, k2)
+                ret = np.bincount((k1 // 10_000_000)[kept], weights=p1[kept], minlength=S)
+                f["ret_1"] = np.where(tot1 > 0, ret / np.maximum(tot1, EPS), np.nan)     # share of last month's pieces that came from merchants who were also selling the month before
+    c0 = int((info["c_first"] - dates[0]).days); c0 = max(c0, 0)
+    km, pm_ = _per_sku_merchant(panel, c0, o)
+    if len(km):
+        sk = km // 10_000_000
+        f["nm_mtd"] = np.bincount(sk[pm_ > 0], minlength=S).astype(float)
+        mtd_tot = np.bincount(sk, weights=pm_, minlength=S)
+        if b1:
+            k1, p1 = _per_sku_merchant(panel, *b1)
+            # last month's biggest merchant of each SKU: how much of this month's pieces still comes from it; and how much comes from merchants who were not selling it last month
+            top_key = {}
+            if len(k1):
+                sk1 = k1 // 10_000_000; order = np.lexsort((p1, sk1)); last = np.r_[sk1[order][1:] != sk1[order][:-1], True]
+                tk = k1[order][last]
+                is_top = np.isin(km, tk)
+                top_p = np.bincount(sk[is_top], weights=pm_[is_top], minlength=S)
+                f["top1_mtd"] = np.where(mtd_tot > 0, top_p / np.maximum(mtd_tot, EPS), np.nan)
+            newm = ~np.isin(km, k1)
+            new_p = np.bincount(sk[newm], weights=pm_[newm], minlength=S)
+            f["new_mtd"] = np.where(mtd_tot > 0, new_p / np.maximum(mtd_tot, EPS), np.nan)
+    a14 = max(o - 13, 0)
+    k14, p14 = _per_sku_merchant(panel, a14, o)
+    if len(k14): f["nm14"] = np.bincount((k14 // 10_000_000)[p14 > 0], minlength=S).astype(float)
+    return f
 
 
 def build_features(panel, o, cat_codes=None):
@@ -122,6 +212,45 @@ def build_features(panel, o, cat_codes=None):
             f[k] = np.where((pn > 0) & (pp > 0), pn / pp - 1.0, np.nan)
     else:
         f["p_chg30"] = np.full(S, np.nan); f["p_chg90"] = np.full(S, np.nan)
+    # --- merchants: how many sell it, how concentrated, who stayed, who is new
+    f.update(merchant_features(panel, o, info, S))
+    # --- inbound that ALREADY happened (nothing about next month: there is no inbound plan for it)
+    if panel.INB is not None:
+        csI = np.concatenate([np.zeros((S, 1)), np.cumsum(panel.INB, axis=1)], axis=1)
+        i30, _ = _win(csI, o, 30); i90, _ = _win(csI, o, 90)
+        f["inb30"], f["inb90"] = i30, i90
+        f["inb_mtd"] = csI[:, o + 1] - csI[:, c_start_idx]
+        nzi = panel.INB[:, :o + 1] > 0
+        anyi = nzi.any(axis=1)
+        f["since_inb"] = np.where(anyi, nzi[:, ::-1].argmax(axis=1), 999).astype(float)
+        f["inb30_m1"] = i30 / (m1f + 1.0)
+    else:
+        for k in ("inb30", "inb90", "inb_mtd", "since_inb", "inb30_m1"): f[k] = np.full(S, np.nan)
+    # --- stock at the start of this month (known) vs how fast it is selling
+    bi = (panel.BI or {}).get(str(info["C"]))
+    if bi is not None:
+        f["bi_c"] = bi
+        f["bi_cover"] = bi / (rate[30] * 30.0 + 1.0)
+        f["avail_pace"] = (np.nan_to_num(bi, nan=0.0) + np.nan_to_num(f["inb_mtd"], nan=0.0)) / (f["mtd_rr"] + 1.0)
+    else:
+        for k in ("bi_c", "bi_cover", "avail_pace"): f[k] = np.full(S, np.nan)
+    # --- how wrong the simple forecasts were for this SKU in the last two months (learning from past misses)
+    def pace_miss(k):
+        pm = info["C"] - k - 1                      # the month whose total we compare ...
+        s_, e_ = pm.start_time.normalize(), pm.end_time.normalize()
+        pe = pm - 1                                 # ... with the 14-day pace known at the end of the month before it
+        pe_end = pe.end_time.normalize()
+        if s_ < dates[0] or e_ > dates[o] or pe_end < dates[13]: return np.full(S, np.nan)
+        ei = int((pe_end - dates[0]).days); si_ = int((s_ - dates[0]).days); ee = int((e_ - dates[0]).days)
+        r14 = (cs[:, ei + 1] - cs[:, ei - 13]) / 14.0
+        actual = cs[:, ee + 1] - cs[:, si_]
+        return np.log1p(actual) - np.log1p(r14 * pm.days_in_month)
+    f["miss_pace1"] = pace_miss(0); f["miss_pace2"] = pace_miss(1)
+    mm = np.vstack([f["m2"], f["m3"], f["m4"]])
+    with np.errstate(all="ignore"), __import__("warnings").catch_warnings():
+        __import__("warnings").simplefilter("ignore")
+        ma_prev = np.nanmean(mm, axis=0)
+    f["miss_ma3_1"] = np.where(np.isnan(f["m1"]) | np.isnan(ma_prev), np.nan, np.log1p(np.nan_to_num(f["m1"])) - np.log1p(np.nan_to_num(ma_prev)))
     f["cat"] = cat_codes.astype(float) if cat_codes is not None else np.full(S, np.nan)
     df = pd.DataFrame({k: f[k] for k in FEATURES})
     df["alive"] = (cs[:, o + 1] - cs[:, max(o - 89, 0)]) > 0           # sold anything in the last 90 days

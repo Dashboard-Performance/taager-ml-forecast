@@ -22,6 +22,21 @@ def _rows(panel, f, lo, hi, seg, extra=None):
     return out
 
 
+def month_table(bt):
+    """Every backtest month, as it would have been forecast on day 7 / 14 / 21 / month end: actual total, forecast totals and accuracy per candidate."""
+    out = {}
+    if bt is None or not len(bt): return out
+    for b, g in bt.groupby("bucket"):
+        rows = []
+        for m, x in g.groupby("month"):
+            r = {"month": m, "actual": _r1(x["y"].sum()), "n": int(len(x))}
+            for k in ("ens", "ens_cal", "gbm_l1", "gbm_l1_cal", "pace14", "naive"):
+                if k in x: r[k] = _r1(accuracy(x["y"], x[k])); r[k + "F"] = _r1(x[k].sum())
+            rows.append(r)
+        out[str(b)] = sorted(rows, key=lambda r: r["month"])
+    return out
+
+
 def is_last_day_of_month(ts): return ts.normalize() == ts.to_period("M").end_time.normalize()
 
 
@@ -38,12 +53,14 @@ def build(panel, fast=False, checks=None, locked_by_month=None):
         "version": __version__, "generatedAt": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "asOf": str(asof.date()),
         "currentMonth": str(info["C"]), "dayOfMonth": info["d"], "daysInMonth": info["len_c"], "targetMonth": str(info["M"]),
         "data": panel.meta | (checks or {}),
+        "features": len(__import__("forecast.features", fromlist=["FEATURES"]).FEATURES),
+        "importance": [[n, round(v, 1)] for n, v in (fc.get("importance") or [])],
         "live": {"month": str(info["M"]), "bucket": fc["bucket"], "champion": fc["champion"], "train": fc["train"],
                  "rows": _rows(panel, fc["f"], fc["lo"], fc["hi"], fc["seg"], [base["naive"], base["ma3"], base["pace14"]])},
         "accuracy": {"next": Engine.summarize(bt), "now": Engine.summarize(bt_now),
                      "months": sorted(bt["month"].unique()) if len(bt) else [],
                      "perMonth": {"end": {k: Engine.per_month(bt, "end", k) for k in ("naive", "ma3", fc["champion"].get("A", "ma3"), "ens") if len(bt) and k in bt}} if len(bt) else {},
-                     "coverageP10P90": eng.coverage(bt, "end", eng.champions(bt, "end")) if len(bt) else None,
+                     "byMonth": month_table(bt), "coverageP10P90": eng.coverage(bt, "end", eng.champions(bt, "end")) if len(bt) else None,
                      "champions": {str(b): eng.champions(bt, b) for b in BUCKETS}},
     }
     if nc is not None:

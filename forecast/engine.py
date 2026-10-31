@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 from .features import FEATURES, build_features, category_codes, origin_info, segment, target_total
-from .models import (BASELINES, CANDIDATES, GBMS, accuracy, apply_band, band_quantiles, baselines, bias, fit, predict)
+from .models import (BASELINES, CAL_BASES, CANDIDATES, GBMS, accuracy, apply_band, band_quantiles, baselines, bias, fit, predict)
 
 BUCKETS = [7, 14, 21, "end"]
 SEGS = ["A", "B", "C"]
@@ -99,7 +99,36 @@ class Engine:
             r = pd.DataFrame({"month": str(info["C"] + offset), "bucket": str(b), "sku": np.arange(len(y)), "seg": seg, "y": y})
             for k, v in preds.items(): r[k] = v
             rows.append(r)
-        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+        bt = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+        return self.add_calibration(bt) if offset == 1 else bt
+
+    @staticmethod
+    def cal_lag(bucket):
+        """how many months back the newest FINISHED target month is: at month end the running month is done (1); mid-month it is not (2)"""
+        return 1 if str(bucket) == "end" else 2
+
+    @staticmethod
+    def cal_factor(g, base, month, lag, last_k=3, min_prior=2):
+        """what the model got wrong, learned: total actual / total forecast over the last K target months that had finished by then (1.0 if fewer than 2)"""
+        per = pd.Period(month, "M")
+        prior = sorted([m for m in g["month"].unique() if pd.Period(m, "M") <= per - lag])[-last_k:]
+        if len(prior) < min_prior: return 1.0
+        gp = g[g["month"].isin(prior)]
+        f = gp[base].sum()
+        return float(gp["y"].sum() / f) if f > 0 else 1.0
+
+    def add_calibration(self, bt):
+        if bt is None or not len(bt): return bt
+        for base in CAL_BASES:
+            if base not in bt: continue
+            bt[base + "_cal"] = bt[base]
+            for (b, s), g in bt.groupby(["bucket", "seg"]):
+                lag = self.cal_lag(b)
+                for m in g["month"].unique():
+                    fac = self.cal_factor(g, base, m, lag)
+                    idx = g.index[g["month"] == m]
+                    bt.loc[idx, base + "_cal"] = bt.loc[idx, base].to_numpy() * fac
+        return bt
 
     @staticmethod
     def bucket_exact(info):
@@ -177,15 +206,30 @@ class Engine:
         cache = {}
         preds, df, info, tm = self.predict_at(o, 1, cache)
         b = self.bucket_of(info)
-        champ = self.champions(bt, b); zq = self.bands(bt, b, champ)
         seg = segment(df)
+        # the same "learn from the misses" correction, from the model's own recent finished months, per segment
+        if bt is not None and len(bt):
+            gb = bt[bt["bucket"] == str(b)]
+            for base in CAL_BASES:
+                if base in preds:
+                    fac = np.ones(len(df))
+                    for s_ in SEGS:
+                        gs = gb[gb["seg"] == s_]
+                        if len(gs): fac[seg == s_] = self.cal_factor(gs, base, str(info["M"]), self.cal_lag(b))
+                    preds[base + "_cal"] = preds[base] * fac
+        champ = self.champions(bt, b); zq = self.bands(bt, b, champ)
         f = np.zeros(len(df)); lo = np.zeros(len(df)); hi = np.zeros(len(df))
         for s in SEGS:
             idx = seg == s; k = champ[s] if champ[s] in preds else "ma3"
             f[idx] = preds[k][idx]; lo[idx], hi[idx] = apply_band(f[idx], zq[s])
         alive = df["alive"].to_numpy()
         lo[~alive] = 0; hi[~alive] = 0
-        return {"f": f, "lo": lo, "hi": hi, "seg": seg, "champion": champ, "info": info, "bucket": str(b), "df": df, "preds": preds, "train": {"months": tm["months"], "rows": tm["rows"]}}
+        imp = None
+        gm = tm["models"].get("gbm_l1")
+        if gm is not None:
+            gain = gm.booster_.feature_importance("gain"); tot = gain.sum()
+            if tot > 0: imp = sorted([(n, float(g_ / tot * 100)) for n, g_ in zip(FEATURES, gain)], key=lambda x: -x[1])[:15]
+        return {"f": f, "lo": lo, "hi": hi, "seg": seg, "importance": imp, "champion": champ, "info": info, "bucket": str(b), "df": df, "preds": preds, "train": {"months": tm["months"], "rows": tm["rows"]}}
 
     def nowcast_now(self, bt_now):
         """Where the CURRENT month is heading (end-of-month total), from the month-to-date."""

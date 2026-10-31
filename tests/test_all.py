@@ -16,20 +16,32 @@ def ok(name, cond):
 
 P = make_panel(300, end="2026-10-30")
 
-# ---- features never read the future
+
+def scrambled(P, o, seed=1):
+    """a copy of the panel in which EVERYTHING after day o (pieces, merchants, inbound, later months' stock) is replaced by noise"""
+    rng = np.random.default_rng(seed)
+    Q, Pp, R = P.Q.copy(), P.P.copy(), P.R.copy()
+    for arr in (Q, Pp, R): arr[:, o + 1:] = rng.integers(0, 500, arr[:, o + 1:].shape)
+    INB = P.INB.copy(); INB[:, o + 1:] = rng.integers(0, 900, INB[:, o + 1:].shape)
+    di, si, mc, q = [x.copy() for x in P.merch]
+    late = di > o
+    mc[late] = rng.integers(0, 50, late.sum()); q[late] = rng.integers(1, 300, late.sum()); si[late] = rng.integers(0, len(P.skus), late.sum())
+    order = np.argsort(di, kind="stable")
+    cur = str(P.dates[o].to_period("M"))
+    BI = {m: (v if m <= cur else rng.integers(0, 5000, v.shape).astype(float)) for m, v in P.BI.items()}
+    return Panel(P.dates, P.skus, Q, Pp, R, P.cat, None, {}, (di[order], si[order], mc[order], q[order]), INB, BI)
+
+# ---- features never read the future (pieces, merchants, inbound, stock, past misses - all of them)
 for d in ["2026-03-15", "2026-06-30", "2026-09-10"]:
     o = int((pd.Timestamp(d) - P.dates[0]).days)
-    a, _ = build_features(P, o)
-    P2 = Panel(P.dates, P.skus, P.Q.copy(), P.P.copy(), P.R.copy(), P.cat, None, {})
-    rng = np.random.default_rng(1)
-    for arr in (P2.Q, P2.P, P2.R): arr[:, o + 1:] = rng.integers(0, 500, arr[:, o + 1:].shape)
-    b, _ = build_features(P2, o)
-    ok("features at %s identical when every later day is scrambled" % d, a.equals(b))
+    a_, _ = build_features(P, o)
+    b_, _ = build_features(scrambled(P, o), o)
+    ok("all %d features at %s identical when everything after that day is scrambled" % (len(FEATURES), d), a_.equals(b_))
+ok("the merchant, inbound, stock and miss features really have values (not all empty)", all(build_features(P, 250)[0][k].notna().mean() > 0.3 for k in ("nm1", "ret_1", "inb30", "bi_c", "miss_pace1")))
 
 # ---- end to end: predictions made at an origin do not depend on anything after it (training uses only finished months)
 o = int((pd.Timestamp("2026-08-14") - P.dates[0]).days)
-P3 = Panel(P.dates, P.skus, P.Q.copy(), P.P.copy(), P.R.copy(), P.cat, None, {})
-P3.Q[:, o + 1:] = np.random.default_rng(5).integers(0, 900, P3.Q[:, o + 1:].shape); P3.P[:, o + 1:] = P3.Q[:, o + 1:]; P3.R[:, o + 1:] = P3.Q[:, o + 1:]
+P3 = scrambled(P, o, seed=5)
 e1, e2 = Engine(P, fast=True), Engine(P3, fast=True)
 p1 = e1.predict_at(o, 1, {})[0]; p2 = e2.predict_at(o, 1, {})[0]
 ok("model forecasts at an origin are unchanged when the future is scrambled (no leakage through training)", all(np.allclose(p1[k], p2[k], atol=1e-6) for k in ("gbm_l1", "naive", "pace14")))
@@ -46,6 +58,12 @@ ch = eng.champions(bt, "end")
 ok("a champion is chosen for every segment", set(ch) == {"A", "B", "C"})
 cov = eng.coverage(bt, "end", ch)
 ok("P10-P90 band covers ~80%% of SKUs out of sample (got %s)" % cov, cov is not None and 65 <= cov <= 92)
+
+# ---- learning from past misses: the correction factor only uses months that had already finished
+g = pd.DataFrame({"month": ["2026-04"] * 2 + ["2026-05"] * 2 + ["2026-06"] * 2 + ["2026-07"] * 2, "y": [100, 100, 100, 100, 100, 100, 100, 100], "gbm_l1": [50, 50, 80, 80, 90, 90, 1, 1]})
+ok("calibration for a month-end forecast of July uses April-June (actual 600 / forecast 440), never July itself", abs(Engine.cal_factor(g, "gbm_l1", "2026-07", 1) - 600 / 440) < 1e-9)
+ok("calibration for a mid-month forecast skips the month that is still running (July: only April-May)", abs(Engine.cal_factor(g, "gbm_l1", "2026-07", 2) - 400 / 260) < 1e-9)
+ok("calibration waits for 2 finished months (June has only April before it at lag 2) -> 1.0", Engine.cal_factor(g, "gbm_l1", "2026-06", 2) == 1.0)
 
 # ---- locking
 def trunc(end):
@@ -64,7 +82,9 @@ sc = pipeline.score_locked(P, lock_sep)
 ok("score_locked: September forecast frozen on Aug 31 is scored against what really happened", sc and sc["month"] == "2026-09" and 0 < sc["ml"] < 100 and "naive" in sc)
 ok("…and the payload lists it under lockedAccuracy", pipeline.build(trunc("2026-10-20"), fast=True, locked_by_month={"2026-09": lock_sep})[0]["lockedAccuracy"][0]["month"] == "2026-09")
 pl3 = pipeline.build(trunc("2026-10-20"), fast=True, locked_by_month={"2026-10": lock})[0]
-ok("this month's frozen forecast is carried in the payload to track the month against", pl3["locked"]["month"] == "2026-10")
+bm = pl["accuracy"]["byMonth"]
+ok("the payload lists every backtest month for each cut-off day, with actual and forecast totals", set(bm) == {"7", "14", "21", "end"} and len(bm["end"]) >= 5 and all("actual" in r and "ens" in r or "gbm_l1" in r for r in bm["end"]))
+ok("this month\'s frozen forecast is carried in the payload to track the month against", pl3["locked"]["month"] == "2026-10")
 
 # ---- maths
 ok("accuracy: perfect forecast = 100, all-zero forecast = 0", accuracy([1, 2, 3], [1, 2, 3]) == 100 and accuracy([1, 2, 3], [0, 0, 0]) == 0)
@@ -81,12 +101,25 @@ ok("a day covered by the newer source takes its numbers, not the history tab's (
 ok("history tab days before the newer source are used (Jan 2: S1 2 pieces)", pn.Q[S1, 1] == 2 and pn.Q[S1, 0] == 6)
 ok("category comes through", pn.cat[S1] == "TOYS")
 po = pd.DataFrame({"DATE_GROUP": ["2026-10-01"] * 3, "PRODUCT_ID": ["A", "A", "B"], "IS_PRIMARY": [True, False, True], "PLC_PIECES_ACTUAL": [10, 4, 1], "CNF_PIECES_ACTUAL": [8, 3, 1], "DLV_PIECES_ACTUAL": [5, 2, 0]})
-d = data.product_only_daily(po)
-ok("Product Only: the IS_PRIMARY true and false rows of a product-day are added together", d[d.sku == "A"].confirmed.iloc[0] == 11 and len(d) == 2)
+d = data.product_only_daily(po, primary_only=False)
+ok("Product Only (all rows): the IS_PRIMARY true and false rows of a product-day are added together", d[d.sku == "A"].confirmed.iloc[0] == 11 and len(d) == 2)
+d1 = data.product_only_daily(po)
+ok("Product Only (default): only IS_PRIMARY rows, the definition the history tab uses (A: 8 not 11)", d1[d1.sku == "A"].confirmed.iloc[0] == 8)
 try: data.product_only_daily(po.drop(columns=["CNF_PIECES_ACTUAL"])); ok("missing column is refused", False)
 except SystemExit: ok("a Product Only answer with a column missing is refused, not read as zero", True)
 oc = data.overlap_check(hist, newer)
 ok("overlap check compares the two sources on the days both cover", oc["days"] == 2)
+csv_main = "CREATION_DATE,TAGER_ID,TAGER_NAME,PRODUCT_ID,PRODUCT_NAME,CATEGORY,SUB_CATEGORY,ITEM_TYPE,ACTIVE_DAYS,PLACED_ORDERS,CONFIRMED_ORDERS,DELIVERED_ORDERS,CR_ORDERS,DR_ORDERS,NDR_ORDERS,PLACED_PIECES,CONFIRMED_PIECES,DELIVERED_PIECES\n" \
+           "2026-09-14,51726,Ahmed,EG030107MAKN99,Vacuum,HOME,HOME INDOOR,CLEANING,1,49,26,9,0.5,0.3,0.1,49,26,9\n2026-09-14,1007827,Faouzi,EG030107MAKN99,Vacuum,HOME,HOME INDOOR,CLEANING,1,21,15,9,0.7,0.6,0.4,21,15,9\n"
+ml = data.main_long(csv_main)
+ok("Main is read BY COLUMN NAME: merchant, product, category and the three piece columns", len(ml) == 2 and ml.confirmed.sum() == 41 and set(ml.merchant) == {"51726", "1007827"} and ml.category.iloc[0] == "HOME")
+hist_like = pd.DataFrame({"PERIOD_FILTER": ["January 1, 2026"], "TAGER_ID": ["86751"], "PRODUCT_ID": ["EG04"], "CATEGORY": ["CONSUMABLES"], "PLACED_PIECES": ["1,035"], "CONFIRMED_PIECES": [736], "DELIVERED_PIECES": [510]})
+try: data.to_long(hist_like.drop(columns=["CONFIRMED_PIECES"]), "History"); ok("a missing column is refused", False)
+except SystemExit: ok("a Main / history table with a column missing is refused, not read as zero", True)
+bi = data.beginning_inventory(pd.DataFrame({"PRODUCT_ID": ["A", "A", "B"], "QTY": [10, 5, 7], "MONTH": ["2026-10-01", "2026-10-01", "2026-09-01"], "PRODUCT_NAME": ["", "", ""]}))
+ok("beginning inventory: per month and SKU (A has two rows in October = 15)", bi["2026-10"]["A"] == 15 and bi["2026-09"]["B"] == 7)
+pm = data.build_panel(ml.assign(date=pd.Timestamp("2026-09-13")), ml, {"EG030107MAKN99": [("S1", 2.0)]}, None, None, as_of="2026-09-14", inbound=pd.DataFrame({"date": [pd.Timestamp("2026-09-14")], "sku": ["S1"], "qty": [100.0]}), bi={"2026-09": pd.Series({"S1": 500.0})})
+ok("bundle rows keep their merchants, pieces x quantity, category, inbound and stock all reach the panel", pm.merch is not None and abs(pm.merch[3].sum() - 164) < 1e-9 and pm.INB[0, -1] == 100 and pm.BI["2026-09"][0] == 500 and pm.cat[0] == "HOME")
 
 ok("as-of = yesterday (Cairo) even when today has no rows yet", str(data.pick_asof("2026-11-01", "2026-10-31").date()) == "2026-10-31")
 ok("as-of = yesterday when today's partial day is already in the data", str(data.pick_asof("2026-11-01", "2026-11-01").date()) == "2026-10-31")
