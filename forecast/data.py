@@ -334,3 +334,25 @@ def pick_asof(today, data_max):
     """The last FULL day: yesterday (Cairo), unless the data itself stops earlier (a stale cache) - never pretend missing days were zero-sales days."""
     y = pd.Timestamp(today).normalize() - pd.Timedelta(days=1)
     return min(y, pd.Timestamp(data_max).normalize())
+
+# --------------------------------------------------------------------------- offline file (exported from the dashboard)
+def load_export(path):
+    """ml-data.json.gz exported from the dashboard page: the same sources the Worker / gviz give, as CSV text.
+    Returns (hist, newer, dmap, bi, inbound, prices) ready for build_panel."""
+    import gzip
+    with gzip.open(path, "rt", encoding="utf-8") as f: d = json.load(f)
+    rd = lambda t: pd.read_csv(io.StringIO(t), dtype=str, keep_default_na=False)
+    def long_(t):
+        x = rd(t)
+        out = pd.DataFrame({"date": pd.to_datetime(x["date"], errors="coerce"), "merchant": x["merchant"].str.strip(), "sku": x["sku"].str.strip(),
+                            "placed": pd.to_numeric(x["placed"], errors="coerce").fillna(0), "confirmed": pd.to_numeric(x["confirmed"], errors="coerce").fillna(0),
+                            "delivered": pd.to_numeric(x["delivered"], errors="coerce").fillna(0), "category": x["category"].str.strip().str.upper()})
+        return out.dropna(subset=["date"])[STD]
+    hist, newer = long_(d["hist"]), long_(d["main"])
+    dd = rd(d["deb"]); dmap = {}
+    for p, sg, q in zip(dd["product"].str.strip(), dd["single"].str.strip(), pd.to_numeric(dd["quantity"], errors="coerce").fillna(1)):
+        if p and sg: dmap.setdefault(p, []).append((sg, float(q) or 1.0))
+    bi = beginning_inventory(rd(d["bi"]))
+    ib = rd(d["inb"]); inbound = pd.DataFrame({"date": pd.to_datetime(ib["date"], errors="coerce"), "sku": ib["sku"].str.strip(), "qty": pd.to_numeric(ib["qty"], errors="coerce")}).dropna()
+    pr = rd(d["prices"]); prices = pd.DataFrame({"sku": pr["sku"].str.strip(), "from": pd.to_datetime(pr["from"], errors="coerce"), "price": pd.to_numeric(pr["price"], errors="coerce")}).dropna() if len(pr) else None
+    return hist, newer, dmap, bi, (inbound if len(inbound) else None), prices

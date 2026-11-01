@@ -80,6 +80,9 @@ class Engine:
             g = predict(tm["models"], df[FEATURES], df["scale"].to_numpy())
             for k, v in g.items(): preds[k] = np.where(alive, v, 0.0)
         for k in BASELINES: preds[k] = np.where(alive, preds[k], 0.0)
+        # blends: the GBM and the Forecast Model recipe read the history differently, so averaging them cancels part of each one's error
+        if "ens" in preds: preds["blend"] = 0.5 * preds["ens"] + 0.5 * preds["dash"]
+        if "gbm_l1" in preds: preds["blend_gbm"] = 0.5 * preds["gbm_l1"] + 0.5 * preds["dash"]
         return preds, df, info, tm
 
     # ---- the backtest

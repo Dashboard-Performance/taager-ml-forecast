@@ -12,11 +12,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker"); ap.add_argument("--key"); ap.add_argument("--since", default="2026-01-01")
     ap.add_argument("--lock-month"); ap.add_argument("--out"); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--fast", action="store_true")
-    ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--demo", action="store_true"); ap.add_argument("--from-file", help="ml-data.json.gz exported from the dashboard (offline run: nothing is fetched or sent)")
     a = ap.parse_args()
     from forecast import data, pipeline
     W = None
-    if a.demo:
+    if a.from_file:
+        hist, newer, dmap, bi, inbound, prices = data.load_export(a.from_file)
+        cairo_today = pd.Timestamp.now(tz="Africa/Cairo").tz_localize(None).normalize()
+        dmax = max(x["date"].max() for x in (hist, newer) if x is not None and len(x))
+        asof = data.pick_asof(cairo_today, dmax)
+        checks = {"overlap": data.overlap_check(hist, newer), "source": "Main + history tab (offline file)", "prices": prices is not None, "inbound": inbound is not None, "beginInventory": bi is not None}
+        panel = data.build_panel(hist, newer, dmap, None, prices, as_of=asof, inbound=inbound, bi=bi)
+        print("offline file: history %d rows, Main %d rows, as of %s" % (len(hist), len(newer), asof.date()))
+    elif a.demo:
         sys.path.insert(0, "tests"); from synth import make_panel
         panel = make_panel(600); checks = {"demo": True}
     else:

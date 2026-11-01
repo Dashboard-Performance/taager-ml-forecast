@@ -14,6 +14,7 @@ FEATURES = [
     "nm1", "nm2", "nm_chg", "top1_1", "hhi_1", "ret_1", "nm_mtd", "nm14", "top1_mtd", "new_mtd",
     "inb30", "inb90", "inb_mtd", "since_inb", "inb30_m1", "bi_c", "bi_cover", "avail_pace",
     "miss_pace1", "miss_pace2", "miss_ma3_1",
+    "tsb_b30", "tsb_c30", "dash_ens", "dash_rate",
 ]
 
 
@@ -49,6 +50,35 @@ def origin_info(dates, o):
     return {"C": C, "M": M, "d": int(day.day), "len_c": int(C.days_in_month), "len_m": int(M.days_in_month),
             "c_first": C.start_time.normalize(), "c_last": C.end_time.normalize(), "m_first": M.start_time.normalize(), "m_last": M.end_time.normalize()}
 
+
+
+# ---------------------------------------------------------------- the Forecast Model's recipe (recent-rate rules + TSB), as features and as a forecast
+def tsb_series(panel, alpha, beta):
+    """TSB (Teunter-Syntetos-Babai) daily rate at every day, one causal pass: the value at day o reads days <= o only."""
+    key = ("tsb", alpha, beta)
+    if key in panel._cache: return panel._cache[key]
+    Q = panel.Q; S, T = Q.shape
+    pre = np.zeros((S, T)); size = np.zeros(S); prob = np.zeros(S); started = np.zeros(S, bool)
+    for i in range(T):
+        d = Q[:, i]; pos = d > 0
+        size = np.where(pos & ~started, d, np.where(pos, alpha * d + (1 - alpha) * size, size))
+        prob = np.where(pos, beta + (1 - beta) * prob, (1 - beta) * prob)
+        started = started | pos
+        pre[:, i] = np.where(started, prob * size, 0.0)
+    panel._cache[key] = pre
+    return pre
+
+
+def dash_rule_features(panel, o, cs):
+    """What the dashboard's Forecast Model computes from the last 30 days, per 30 days: the average of its recent-rate rules (segment A: 70% of it) and TSB (the other 30%)."""
+    def w(n):
+        a = max(o - n + 1, 0); return cs[:, o + 1] - cs[:, a]
+    tot, l7, l10, l14, l15, l21 = w(30), w(7), w(10), w(14), w(15), w(21)
+    cap = lambda v: np.maximum(tot * 0.6, np.minimum(tot * 1.4, v))
+    rules = [tot, cap(l7 * 30 / 7), cap(l10 * 3), l14 * 30 / 14, cap(l15 * 2), l21 * 30 / 21, 0.5 * (l14 * 30 / 14) + 0.5 * tot]
+    ens = np.mean([np.maximum(0.0, r) for r in rules], axis=0)
+    tb = tsb_series(panel, 0.2, 0.2)[:, o] * 30.0; tc = tsb_series(panel, 0.5, 0.1)[:, o] * 30.0
+    return {"tsb_b30": tb, "tsb_c30": tc, "dash_ens": ens, "dash_rate": 0.7 * ens + 0.3 * tc}
 
 
 # ---------------------------------------------------------------- merchants (who sells the SKU)
@@ -251,6 +281,7 @@ def build_features(panel, o, cat_codes=None):
         __import__("warnings").simplefilter("ignore")
         ma_prev = np.nanmean(mm, axis=0)
     f["miss_ma3_1"] = np.where(np.isnan(f["m1"]) | np.isnan(ma_prev), np.nan, np.log1p(np.nan_to_num(f["m1"])) - np.log1p(np.nan_to_num(ma_prev)))
+    f.update(dash_rule_features(panel, o, cs))
     f["cat"] = cat_codes.astype(float) if cat_codes is not None else np.full(S, np.nan)
     df = pd.DataFrame({k: f[k] for k in FEATURES})
     df["alive"] = (cs[:, o + 1] - cs[:, max(o - 89, 0)]) > 0           # sold anything in the last 90 days

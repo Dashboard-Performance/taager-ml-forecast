@@ -8,9 +8,10 @@ import pandas as pd
 
 from .features import FEATURES
 
-BASELINES = ["naive", "ma3", "pace14", "pace30", "pace_mtd"]
+BASELINES = ["naive", "ma3", "pace14", "pace30", "pace_mtd", "dash"]   # "dash" = the Forecast Model's recipe (average of its recent-rate rules + TSB), see features.dash_rule_features
 GBMS = ["gbm_l1", "gbm_tw", "gbm_log"]
-CANDIDATES = BASELINES + GBMS + ["ens", "gbm_l1_cal", "ens_cal"]
+BLENDS = ["blend", "blend_gbm"]   # 50 / 50 of the GBM ensemble (or the L1 GBM) and the Forecast Model recipe: two different ways of reading the same history, so their errors partly cancel
+CANDIDATES = BASELINES + GBMS + ["ens", "gbm_l1_cal", "ens_cal"] + BLENDS
 CAL_BASES = ("gbm_l1", "ens")
 PARAMS = dict(n_estimators=300, learning_rate=0.04, num_leaves=31, min_child_samples=40, subsample=0.8, subsample_freq=1,
               colsample_bytree=0.8, reg_lambda=1.0, random_state=7, n_jobs=2, verbose=-1, deterministic=True, force_row_wise=True)
@@ -25,10 +26,12 @@ def baselines(df, offset):
     naive = np.where(np.isnan(df["m1"].to_numpy()), ma3, df["m1"].to_numpy())
     lm, lc, d = df["len_m"].to_numpy(), df["len_c"].to_numpy(), df["d"].to_numpy()
     if offset == 1:
-        return {"naive": naive, "ma3": ma3, "pace14": df["r14"].to_numpy() * lm, "pace30": df["r30"].to_numpy() * lm, "pace_mtd": df["mtd_rr"].to_numpy() / lc * lm}
+        return {"naive": naive, "ma3": ma3, "pace14": df["r14"].to_numpy() * lm, "pace30": df["r30"].to_numpy() * lm, "pace_mtd": df["mtd_rr"].to_numpy() / lc * lm,
+                "dash": df["dash_rate"].to_numpy() / 30.0 * lm}
     rest = lc - d
     mtd = df["mtd"].to_numpy()
-    return {"naive": naive, "ma3": ma3, "pace14": mtd + df["r14"].to_numpy() * rest, "pace30": mtd + df["r30"].to_numpy() * rest, "pace_mtd": df["mtd_rr"].to_numpy()}
+    return {"naive": naive, "ma3": ma3, "pace14": mtd + df["r14"].to_numpy() * rest, "pace30": mtd + df["r30"].to_numpy() * rest, "pace_mtd": df["mtd_rr"].to_numpy(),
+            "dash": mtd + df["dash_rate"].to_numpy() / 30.0 * rest}
 
 
 def fit(X, y, scale, which=GBMS):

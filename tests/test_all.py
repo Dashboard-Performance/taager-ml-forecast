@@ -163,4 +163,27 @@ except RuntimeError as e:
     ok("an HTTP error says what the server answered (status + body), not just the number", "403" in str(e) and "nope" in str(e))
 ok("every request carries our own User-Agent (Cloudflare blocks Python's default one)", seen["ua"].startswith("taager-ml-forecast/"))
 srv2.shutdown(); srv.shutdown()
+
+# ---- the Forecast Model recipe ("dash") and the blends
+from forecast.features import dash_rule_features, tsb_series
+from forecast.models import baselines, CANDIDATES
+Pq = make_panel(120, end="2026-10-30"); oq = len(Pq.dates) - 1
+csq = np.concatenate([np.zeros((Pq.Q.shape[0], 1)), np.cumsum(Pq.Q, axis=1)], axis=1)
+dfq = dash_rule_features(Pq, oq, csq)
+w = lambda n: csq[:, oq + 1] - csq[:, oq + 1 - n]
+tot = w(30); cp = lambda v: np.maximum(tot * 0.6, np.minimum(tot * 1.4, v))
+rules = [tot, cp(w(7) * 30 / 7), cp(w(10) * 3), w(14) * 30 / 14, cp(w(15) * 2), w(21) * 30 / 21, 0.5 * (w(14) * 30 / 14) + 0.5 * tot]
+ok("dash recipe = average of the 7 recent-rate rules (capped +-40% where the Forecast Model caps them)", np.allclose(dfq["dash_ens"], np.mean([np.maximum(0, r) for r in rules], axis=0)))
+x = Pq.Q[3]; size = prob = 0.0; st = False
+for v in x:
+    if v > 0: size = v if not st else 0.5 * v + 0.5 * size; prob = 0.1 + 0.9 * prob; st = True
+    else: prob = 0.9 * prob
+ok("TSB rate (alpha .5 / beta .1) matches a hand-written loop for one SKU", abs(dfq["tsb_c30"][3] - (prob * size * 30 if st else 0.0)) < 1e-9)
+ok("dash_rate = 70% rules + 30% TSB (segment A of the Forecast Model)", np.allclose(dfq["dash_rate"], 0.7 * dfq["dash_ens"] + 0.3 * dfq["tsb_c30"]))
+dff, _ = build_features(Pq, oq)
+ok("dash baseline = dash_rate per day x days of the target month", np.allclose(baselines(dff, 1)["dash"], dff["dash_rate"] / 30.0 * dff["len_m"]))
+engq = Engine(Pq, fast=True); predq, dfp, infq, tmq = engq.predict_at(oq, 1, {})
+ok("blend = 50% GBM ensemble + 50% recipe, blend_gbm = 50% L1 GBM + 50% recipe", ("blend" not in predq) or (np.allclose(predq["blend"], 0.5 * predq["ens"] + 0.5 * predq["dash"]) and np.allclose(predq["blend_gbm"], 0.5 * predq["gbm_l1"] + 0.5 * predq["dash"])))
+ok("the new candidates are scored like every other one (and can be champion)", all(k in CANDIDATES for k in ("dash", "blend", "blend_gbm")))
+
 print("\n%d passed" % n_pass)
