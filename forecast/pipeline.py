@@ -37,6 +37,49 @@ def month_table(bt):
     return out
 
 
+SPLIT_KEYS = ["under_inbound", "under_demand", "over_demand", "empty_restocked", "empty_no_restock", "stockout", "no_stock_data"]
+
+
+def error_split(panel, bt, eng):
+    """v2.2 — where the month-end forecast error comes from, for every scored month the Stock Archive covers (>= 20 days of it).
+    The forecast used for a month is the champion chosen from the 3 months BEFORE it (what the model would really have shown)."""
+    STK = getattr(panel, "STK", None)
+    if STK is None or bt is None or not len(bt): return None
+    g = bt[bt["bucket"] == "end"]; months = sorted(g["month"].unique()); out = []
+    d0 = panel.dates[0]
+    for m in months:
+        M = pd.Period(m, "M"); a = int((M.start_time - d0).days); b = min(int((M.end_time.normalize() - d0).days) + 1, len(panel.dates))
+        if a < 1 or b - a < 20: continue
+        W = STK[:, a:b]; known = np.isfinite(W).sum(axis=1)
+        if np.isfinite(W).any(axis=0).sum() < 20: continue
+        prev = g[g["month"] < m]
+        if not len(prev): continue
+        ch = eng.champions(prev, "end")
+        x = g[g["month"] == m]; f = np.zeros(len(x))
+        for sg in SEGS:
+            idx = (x["seg"] == sg).to_numpy(); k = ch.get(sg)
+            if k in x: f[idx] = x[k].to_numpy()[idx]
+        sk = x["sku"].to_numpy(); y = x["y"].to_numpy()
+        so = STK[:, a - 1]
+        for k_ in (2, 3, 4):
+            if a - k_ >= 0: so = np.where(np.isfinite(so), so, STK[:, a - k_])
+        so = so[sk]; oos = np.where(known[sk] > 0, (W[sk] == 0).sum(axis=1) / np.maximum(known[sk], 1), np.nan)
+        inb = panel.INB[sk, a:b].sum(axis=1) if panel.INB is not None else np.zeros(len(sk))
+        cls = np.where(~np.isfinite(so), "no_stock_data",
+              np.where((oos >= 0.3) & (f > y), "stockout",
+              np.where((so <= 0) & (inb > 0), "empty_restocked",
+              np.where(so <= 0, "empty_no_restock",
+              np.where((y > f) & (inb > 0), "under_inbound",
+              np.where(y > f, "under_demand", "over_demand"))))))
+        ae = np.abs(y - f); tot = ae.sum()
+        rows = {}
+        for c in SPLIT_KEYS:
+            i = cls == c
+            if i.any(): rows[c] = {"n": int(i.sum()), "actual": _r1(y[i].sum()), "forecast": _r1(f[i].sum()), "error": _r1(ae[i].sum()), "share": _r1(ae[i].sum() / tot * 100) if tot > 0 else 0.0}
+        out.append({"month": m, "accuracy": _r1(accuracy(y, f)), "classes": rows})
+    return out or None
+
+
 def is_last_day_of_month(ts): return ts.normalize() == ts.to_period("M").end_time.normalize()
 
 
@@ -61,7 +104,10 @@ def build(panel, fast=False, checks=None, locked_by_month=None):
                      "months": sorted(bt["month"].unique()) if len(bt) else [],
                      "perMonth": {"end": {k: Engine.per_month(bt, "end", k) for k in ("naive", "ma3", fc["champion"].get("A", "ma3"), "ens") if len(bt) and k in bt}} if len(bt) else {},
                      "byMonth": month_table(bt), "coverageP10P90": eng.coverage(bt, "end", eng.champions(bt, "end")) if len(bt) else None,
-                     "champions": {str(b): eng.champions(bt, b) for b in BUCKETS}},
+                     "champions": {str(b): eng.champions(bt, b) for b in BUCKETS},
+                     "errorSplit": error_split(panel, bt, eng)},
+        "stockCap": {"noInboundDays": __import__("forecast.engine", fromlist=["x"]).CAP_NO_INBOUND_DAYS, "stockX": __import__("forecast.engine", fromlist=["x"]).CAP_STOCK_X,
+                     "skus": int(Engine.cap_mask(info)[0].sum()) if Engine.cap_mask(info)[0] is not None else 0},
     }
     if nc is not None:
         payload["nowcast"] = {"month": str(info["C"]), "champion": nc["champion"], "rows": {s: [_r1(nc["mtd"][i]), _r1(nc["f"][i])] for i, s in enumerate(panel.skus) if nc["f"][i] > 0}}

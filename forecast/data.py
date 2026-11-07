@@ -21,6 +21,7 @@ GID_PRODUCT_ONLY = "7100000002"
 GID_MAIN = "2099497960"            # Main = the Matches query (merchant x product x day): the SAME columns as the history tab
 GID_BEGIN_INV = "22283311"
 INBOUND_GID = "565878313"
+STOCK_ARCHIVE_GID = "1289659887"     # Stock_Archive: one row per SKU, one column per day ("23-August" ...), stock on hand that day — from 23 Aug 2026
 GID_DEBUNDLE = "1409034448"
 GID_PRODUCTS = "1779314157"
 
@@ -38,11 +39,14 @@ class Panel:
     merch: tuple = None                # (day_idx, sku_idx, merchant_code, pieces) sorted by day — who sold what (confirmed pieces)
     INB: np.ndarray = None             # (S,T) pieces received into the warehouse that day (Inbound sheet) or None
     BI: dict = None                    # {"2026-10": (S,) beginning inventory of that month} or None
+    INBH: np.ndarray = None            # (S, off+T) inbound over the WHOLE Inbound sheet (back to 2025): the buying pattern needs more than the panel's months
+    inbh_off: int = 0                  # how many days INBH starts before dates[0]
+    STK: np.ndarray = None             # (S,T) stock on hand that day from the Stock Archive (NaN = day not archived) or None
     _cache: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- fetching
-UA = "taager-ml-forecast/2.0 (+https://github.com/Dashboard-Performance/taager-ml-forecast)"   # Cloudflare answers 403 to Python's default User-Agent
+UA = "taager-ml-forecast/2.2 (+https://github.com/Dashboard-Performance/taager-ml-forecast)"   # Cloudflare answers 403 to Python's default User-Agent
 
 
 class HttpError(RuntimeError):
@@ -175,6 +179,58 @@ def fetch_inbound():
         print("inbound unavailable:", e); return None
 
 
+_MONTHS = {m: i for i, m in enumerate(["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"], 1)}
+
+
+def archive_dates(labels, as_of):
+    """Stock_Archive column titles carry no year ("23-August"). The columns run forward in time and the last one is on/before as_of:
+    walk back from the end and step the year back whenever the month goes UP (Jan -> Dec of the year before). None = not a date."""
+    parsed = []
+    for lab in labels:
+        try:
+            d, m = str(lab).strip().split("-", 1); parsed.append((int(d), _MONTHS[m.strip().upper()]))
+        except Exception:
+            parsed.append(None)
+    out = [None] * len(parsed); year = as_of.year; prev_m = None
+    for i in range(len(parsed) - 1, -1, -1):
+        if parsed[i] is None: continue
+        d, m = parsed[i]
+        if prev_m is None and m > as_of.month: year -= 1
+        elif prev_m is not None and m > prev_m: year -= 1
+        prev_m = m
+        try: out[i] = pd.Timestamp(year, m, d)
+        except Exception: out[i] = None
+    return out
+
+
+def stock_archive_long(labels, rows, as_of):
+    """labels: the day columns' titles; rows: [sku, value per day...] -> DataFrame(sku, date, qty). Blank cells are skipped (not zero)."""
+    ds = archive_dates(labels, as_of); out = []
+    for r in rows:
+        sku = str(r[0] or "").strip()
+        if not sku or sku.upper() == "SKU_ID": continue
+        for j, dte in enumerate(ds):
+            if dte is None or dte > as_of or j + 1 >= len(r): continue
+            v = r[j + 1]
+            if v is None or v == "": continue
+            try: out.append((sku, dte, float(str(v).replace(",", ""))))
+            except ValueError: continue
+    return pd.DataFrame(out, columns=["sku", "date", "qty"])
+
+
+def fetch_stock_archive(as_of):
+    """Stock_Archive tab (gviz). Optional: None if the tab does not look as expected."""
+    try:
+        res = _gviz(STOCK_ARCHIVE_GID, "select *")["table"]
+        cols = res["cols"]; labels = [(c.get("label") or "").strip() for c in cols]
+        if not labels or labels[0].upper() != "SKU_ID": return None      # Google answers with the FIRST sheet when a gid does not exist
+        rows = [[(c or {}).get("v") for c in r["c"]] for r in res["rows"]]
+        rows = [[r[0]] + r[2:] for r in rows]                              # drop SKU_NAME
+        return stock_archive_long(labels[2:], rows, as_of)
+    except Exception as e:
+        print("stock archive unavailable:", e); return None
+
+
 def beginning_inventory(df):
     """[PRODUCT_ID, QTY, MONTH] -> {'2026-10': Series(sku -> qty)}"""
     c = {x.upper(): x for x in df.columns}
@@ -254,7 +310,7 @@ def category_map(df):
     return {str(a).strip(): str(b).strip().upper() for a, b in zip(df[pid], df[cat]) if str(b) not in ("", "nan", "None")}
 
 
-def build_panel(hist, newer, dmap=None, cats=None, prices=None, as_of=None, inbound=None, bi=None):
+def build_panel(hist, newer, dmap=None, cats=None, prices=None, as_of=None, inbound=None, bi=None, stock=None):
     """hist / newer: long tables [date, merchant, sku, placed, confirmed, delivered, category]. `newer` (Main) wins on the days it covers.
     as_of = last FULL day (default: the day before the last day in the data)."""
     frames = []
@@ -311,14 +367,29 @@ def build_panel(hist, newer, dmap=None, cats=None, prices=None, as_of=None, inbo
         INB = np.zeros((len(skus), len(dates)))
         ib = inbound[inbound["sku"].isin(si) & (inbound["date"] >= dates[0]) & (inbound["date"] <= as_of)]
         np.add.at(INB, (ib["sku"].map(si).to_numpy(), ib["date"].map(di).to_numpy()), ib["qty"].to_numpy())
+    INBH, inbh_off = None, 0
+    if inbound is not None and len(inbound):
+        h0 = max(min(inbound["date"].min(), dates[0]), dates[0] - pd.Timedelta(days=730))
+        inbh_off = int((dates[0] - h0).days)
+        ibh = inbound[inbound["sku"].isin(si) & (inbound["date"] >= h0) & (inbound["date"] <= as_of)]
+        INBH = np.zeros((len(skus), inbh_off + len(dates)))
+        np.add.at(INBH, (ibh["sku"].map(si).to_numpy(), (ibh["date"] - h0).dt.days.to_numpy()), ibh["qty"].to_numpy())
+    STK = None
+    if stock is not None and len(stock):
+        st = stock[stock["sku"].isin(si) & (stock["date"] >= dates[0]) & (stock["date"] <= as_of)]
+        if len(st):
+            STK = np.full((len(skus), len(dates)), np.nan)
+            g = st.groupby(["sku", "date"], as_index=False)["qty"].sum()
+            STK[g["sku"].map(si).to_numpy(), g["date"].map(di).to_numpy()] = g["qty"].to_numpy()
     BI = None
     if bi:
         BI = {m: ser.reindex(skus).to_numpy(dtype=float) for m, ser in bi.items()}
     meta = {"firstDay": str(dates[0].date()), "asOf": str(as_of.date()), "skus": int(len(skus)), "historyRows": int(len(hist) if hist is not None else 0), "newerRows": int(len(newer) if newer is not None else 0),
             "newerFrom": str(cut.date()) if cut is not None else None, "merchants": int(mt[2].max() + 1) if mt is not None and len(mt[2]) else 0,
             "pricedSkus": int(np.isfinite(price).any(axis=1).sum()) if price is not None else 0, "inboundSkus": int((INB.sum(axis=1) > 0).sum()) if INB is not None else 0,
-            "beginInvMonths": sorted(BI) if BI else []}
-    return Panel(dates, skus, Q, P, R, cat, price, meta, mt, INB, BI)
+            "beginInvMonths": sorted(BI) if BI else [], "inboundFrom": str((dates[0] - pd.Timedelta(days=inbh_off)).date()) if INBH is not None else None,
+            "stockArchiveDays": int(np.isfinite(STK).any(axis=0).sum()) if STK is not None else 0}
+    return Panel(dates, skus, Q, P, R, cat, price, meta, mt, INB, BI, INBH=INBH, inbh_off=inbh_off, STK=STK)
 
 
 def overlap_check(hist, newer):

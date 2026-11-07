@@ -6,6 +6,10 @@ from .features import FEATURES, build_features, category_codes, origin_info, seg
 from .models import (BASELINES, CAL_BASES, CANDIDATES, GBMS, accuracy, apply_band, band_quantiles, baselines, bias, fit, predict)
 
 BUCKETS = [7, 14, 21, "end"]
+# v2.2 — stock cap (tested on Apr–Oct 2026): a SKU we have not bought for more than CAP_NO_INBOUND_DAYS cannot sell much more than the
+# stock it has now -> next month's forecast <= CAP_STOCK_X x stock on hand. Only where the stock is known (Stock Archive / beginning inventory).
+CAP_NO_INBOUND_DAYS = 90
+CAP_STOCK_X = 1.5
 SEGS = ["A", "B", "C"]
 
 
@@ -83,7 +87,21 @@ class Engine:
         # blends: the GBM and the Forecast Model recipe read the history differently, so averaging them cancels part of each one's error
         if "ens" in preds: preds["blend"] = 0.5 * preds["ens"] + 0.5 * preds["dash"]
         if "gbm_l1" in preds: preds["blend_gbm"] = 0.5 * preds["gbm_l1"] + 0.5 * preds["dash"]
+        if offset == 1: preds = self.stock_cap(preds, info)
         return preds, df, info, tm
+
+    @staticmethod
+    def cap_mask(info):
+        st, since = info.get("stock_now"), info.get("since_inb_h")
+        if st is None or since is None: return None, None
+        return (since > CAP_NO_INBOUND_DAYS) & np.isfinite(st), st
+
+    @classmethod
+    def stock_cap(cls, preds, info):
+        m, st = cls.cap_mask(info)
+        if m is None or not m.any(): return preds
+        lim = np.where(m, np.nan_to_num(st) * CAP_STOCK_X, np.inf)
+        return {k: np.minimum(v, lim) for k, v in preds.items()}
 
     # ---- the backtest
     def backtest(self, offset=1, buckets=None):
@@ -101,9 +119,16 @@ class Engine:
             seg = segment(df)
             r = pd.DataFrame({"month": str(info["C"] + offset), "bucket": str(b), "sku": np.arange(len(y)), "seg": seg, "y": y})
             for k, v in preds.items(): r[k] = v
+            if offset == 1:
+                m, st = self.cap_mask(info)
+                r["_lim"] = np.inf if m is None else np.where(m, np.nan_to_num(st) * CAP_STOCK_X, np.inf)
             rows.append(r)
         bt = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-        return self.add_calibration(bt) if offset == 1 else bt
+        if offset != 1 or not len(bt): return bt
+        bt = self.add_calibration(bt)
+        for k in CANDIDATES:                                   # the calibrated copies obey the same stock cap
+            if k in bt: bt[k] = np.minimum(bt[k].to_numpy(), bt["_lim"].to_numpy())
+        return bt.drop(columns=["_lim"])
 
     @staticmethod
     def cal_lag(bucket):
@@ -220,6 +245,7 @@ class Engine:
                         gs = gb[gb["seg"] == s_]
                         if len(gs): fac[seg == s_] = self.cal_factor(gs, base, str(info["M"]), self.cal_lag(b))
                     preds[base + "_cal"] = preds[base] * fac
+            preds = self.stock_cap(preds, info)
         champ = self.champions(bt, b); zq = self.bands(bt, b, champ)
         f = np.zeros(len(df)); lo = np.zeros(len(df)); hi = np.zeros(len(df))
         for s in SEGS:

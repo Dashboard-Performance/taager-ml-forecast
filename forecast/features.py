@@ -13,6 +13,7 @@ FEATURES = [
     "p_chg30", "p_chg90", "cat",
     "nm1", "nm2", "nm_chg", "top1_1", "hhi_1", "ret_1", "nm_mtd", "nm14", "top1_mtd", "new_mtd",
     "inb30", "inb90", "inb_mtd", "since_inb", "inb30_m1", "bi_c", "bi_cover", "avail_pace",
+    "inb_n180", "inb_n365", "inb_gap_med", "inb_due", "inb_mon6", "inb_buy_sell180", "inb_last_cover", "inb_first_age",
     "miss_pace1", "miss_pace2", "miss_ma3_1",
     "tsb_b30", "tsb_c30", "dash_ens", "dash_rate",
 ]
@@ -167,6 +168,62 @@ def merchant_features(panel, o, info, S):
     return f
 
 
+def _inbound_history(panel):
+    """(H, off): daily inbound per SKU over the WHOLE Inbound sheet (back to 2025), and how many days H starts before panel.dates[0]."""
+    H = getattr(panel, "INBH", None)
+    if H is not None: return H, int(getattr(panel, "inbh_off", 0) or 0)
+    return panel.INB, 0
+
+
+def purchase_features(panel, o, info, S):
+    """v2.2 — what the buying team has been doing for this SKU (known at the origin: only inbound that already arrived). There is no
+    inbound plan for next month, so the model learns from the PATTERN: how often we buy it, whether a buy is due, how much we buy vs sell."""
+    keys = ("inb_n180", "inb_n365", "inb_gap_med", "inb_due", "inb_mon6", "inb_buy_sell180", "inb_last_cover", "inb_first_age")
+    H, off = _inbound_history(panel)
+    out = {k: np.full(S, np.nan) for k in keys}
+    if H is None:
+        return out, np.full(S, np.nan)
+    t = o + off                                         # the origin in H's day index
+    Hc = H[:, :t + 1]
+    csH = np.concatenate([np.zeros((S, 1)), np.cumsum(Hc, axis=1)], axis=1)
+    csQ = np.concatenate([np.zeros((S, 1)), np.cumsum(panel.Q[:, :o + 1], axis=1)], axis=1)
+    sales180 = csQ[:, o + 1] - csQ[:, max(0, o + 1 - 180)]
+    r30 = (csQ[:, o + 1] - csQ[:, max(0, o - 29)]) / 30.0
+    out["inb_buy_sell180"] = (csH[:, t + 1] - csH[:, max(0, t + 1 - 180)]) / (sales180 + 10.0)
+    since_h = np.full(S, 9999.0)
+    mstart = [(info["C"] - k) for k in range(0, 6)]
+    h0 = panel.dates[0] - pd.Timedelta(days=off)
+    mon_lo = [int((m.start_time.normalize() - h0).days) for m in mstart]
+    mon_hi = [int((m.end_time.normalize() - h0).days) for m in mstart]
+    for s in range(S):
+        e = np.flatnonzero(Hc[s] > 0)
+        if not len(e):
+            out["inb_n180"][s] = 0.0; out["inb_n365"][s] = 0.0; out["inb_mon6"][s] = 0.0; continue
+        out["inb_n180"][s] = float((e > t - 180).sum()); out["inb_n365"][s] = float((e > t - 365).sum())
+        out["inb_first_age"][s] = float(t - e[0])
+        last = e[-1]; since_h[s] = float(t - last)
+        gaps = np.diff(e[e > t - 365]); gaps = gaps[gaps > 3]          # one delivery spread over a few days counts once
+        if len(gaps):
+            gm = float(np.median(gaps)); out["inb_gap_med"][s] = gm; out["inb_due"][s] = since_h[s] / gm
+        out["inb_last_cover"][s] = Hc[s, last] / (r30[s] + 0.1)
+        out["inb_mon6"][s] = float(sum(((e >= lo) & (e <= hi)).any() for lo, hi in zip(mon_lo, mon_hi)))
+    return out, since_h
+
+
+def stock_now(panel, o, info):
+    """Stock on hand at the origin: the Stock Archive (daily, from 23 Aug 2026) if it has that day (or one of the 3 before);
+    at a month-end origin before the archive existed, the next month's beginning inventory (= stock at the end of this month). NaN = unknown."""
+    S = panel.Q.shape[0]; now = np.full(S, np.nan)
+    STK = getattr(panel, "STK", None)
+    if STK is not None:
+        for k in range(0, 4):
+            if o - k >= 0: now = np.where(np.isfinite(now), now, STK[:, o - k])
+    if info["d"] >= info["len_c"] and panel.BI:
+        nb = panel.BI.get(str(info["C"] + 1))
+        if nb is not None: now = np.where(np.isfinite(now), now, nb)
+    return now
+
+
 def build_features(panel, o, cat_codes=None):
     dates, Q, P, R = panel.dates, panel.Q, panel.P, panel.R
     S = Q.shape[0]
@@ -283,6 +340,8 @@ def build_features(panel, o, cat_codes=None):
     f["miss_ma3_1"] = np.where(np.isnan(f["m1"]) | np.isnan(ma_prev), np.nan, np.log1p(np.nan_to_num(f["m1"])) - np.log1p(np.nan_to_num(ma_prev)))
     f.update(dash_rule_features(panel, o, cs))
     f["cat"] = cat_codes.astype(float) if cat_codes is not None else np.full(S, np.nan)
+    pf, since_h = purchase_features(panel, o, info, S); f.update(pf)
+    info["since_inb_h"] = since_h; info["stock_now"] = stock_now(panel, o, info)
     df = pd.DataFrame({k: f[k] for k in FEATURES})
     df["alive"] = (cs[:, o + 1] - cs[:, max(o - 89, 0)]) > 0           # sold anything in the last 90 days
     return df, info

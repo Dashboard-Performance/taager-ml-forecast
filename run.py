@@ -12,6 +12,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker"); ap.add_argument("--key"); ap.add_argument("--since", default="2026-01-01")
     ap.add_argument("--lock-month"); ap.add_argument("--out"); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--fast", action="store_true")
+    ap.add_argument("--stock-file", help="(offline) Stock_Archive as a pickled DataFrame(sku, date, qty) or CSV with those columns")
     ap.add_argument("--demo", action="store_true"); ap.add_argument("--from-file", help="ml-data.json.gz exported from the dashboard (offline run: nothing is fetched or sent)")
     a = ap.parse_args()
     from forecast import data, pipeline
@@ -22,7 +23,10 @@ def main():
         dmax = max(x["date"].max() for x in (hist, newer) if x is not None and len(x))
         asof = data.pick_asof(cairo_today, dmax)
         checks = {"overlap": data.overlap_check(hist, newer), "source": "Main + history tab (offline file)", "prices": prices is not None, "inbound": inbound is not None, "beginInventory": bi is not None}
-        panel = data.build_panel(hist, newer, dmap, None, prices, as_of=asof, inbound=inbound, bi=bi)
+        stock = None
+        if a.stock_file:
+            stock = pd.read_pickle(a.stock_file) if a.stock_file.endswith(".pkl") else pd.read_csv(a.stock_file, parse_dates=["date"])
+        panel = data.build_panel(hist, newer, dmap, None, prices, as_of=asof, inbound=inbound, bi=bi, stock=stock)
         print("offline file: history %d rows, Main %d rows, as of %s" % (len(hist), len(newer), asof.date()))
     elif a.demo:
         sys.path.insert(0, "tests"); from synth import make_panel
@@ -39,14 +43,15 @@ def main():
         print("Worker sources ok: Main %d rows (%s .. %s), %d bundles mapped" % (len(newer), newer["date"].min().date(), newer["date"].max().date(), len(dmap)), flush=True)
         hist = data.fetch_history_long(pd.Timestamp(a.since), today)
         inbound = data.fetch_inbound(); prices = data.fetch_prices()
-        checks = {"overlap": data.overlap_check(hist, newer), "source": "Main + history tab", "prices": prices is not None, "inbound": inbound is not None, "beginInventory": bool(bi)}
+        stock = data.fetch_stock_archive(pd.Timestamp.now(tz="Africa/Cairo").tz_localize(None).normalize())
+        checks = {"overlap": data.overlap_check(hist, newer), "source": "Main + history tab", "prices": prices is not None, "inbound": inbound is not None, "beginInventory": bool(bi), "stockArchive": stock is not None and len(stock) > 0}
         cairo_today = pd.Timestamp.now(tz="Africa/Cairo").tz_localize(None).normalize()
         dmax = max(x["date"].max() for x in (hist, newer) if x is not None and len(x))
         asof = data.pick_asof(cairo_today, dmax)
         if asof < cairo_today - pd.Timedelta(days=1): checks["stale"] = "data stops at %s" % dmax.date()
         if a.lock_month:   # replay the day before that month started
             m = pd.Period(a.lock_month, "M"); asof = (m.start_time - pd.Timedelta(days=1)).normalize()
-        panel = data.build_panel(hist, newer, dmap, None, prices, as_of=asof, inbound=inbound, bi=bi)
+        panel = data.build_panel(hist, newer, dmap, None, prices, as_of=asof, inbound=inbound, bi=bi, stock=stock)
     locked = {}
     if W is not None:
         for m in (W.get(lst=True) or {}).get("months", []):

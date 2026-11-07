@@ -186,4 +186,58 @@ engq = Engine(Pq, fast=True); predq, dfp, infq, tmq = engq.predict_at(oq, 1, {})
 ok("blend = 50% GBM ensemble + 50% recipe, blend_gbm = 50% L1 GBM + 50% recipe", ("blend" not in predq) or (np.allclose(predq["blend"], 0.5 * predq["ens"] + 0.5 * predq["dash"]) and np.allclose(predq["blend_gbm"], 0.5 * predq["gbm_l1"] + 0.5 * predq["dash"])))
 ok("the new candidates are scored like every other one (and can be champion)", all(k in CANDIDATES for k in ("dash", "blend", "blend_gbm")))
 
+
+# ---- v2.2: buying pattern (whole Inbound sheet), Stock Archive, stock cap, where the error comes from
+from forecast.features import purchase_features, stock_now, origin_info
+from forecast import engine as ENG
+ad = data.archive_dates(["30-December", "31-December", "01-January", "02-January", "bad"], pd.Timestamp("2027-01-05"))
+ok("Stock Archive titles have no year: Dec -> Jan rolls the year (30 Dec 2026 .. 2 Jan 2027), a bad title is skipped",
+   ad[:4] == [pd.Timestamp(2026, 12, 30), pd.Timestamp(2026, 12, 31), pd.Timestamp(2027, 1, 1), pd.Timestamp(2027, 1, 2)] and ad[4] is None)
+ad2 = data.archive_dates(["23-August", "30-September", "05-November"], pd.Timestamp("2026-11-05"))
+ok("…and Aug–Nov of the same year stay in 2026", ad2 == [pd.Timestamp(2026, 8, 23), pd.Timestamp(2026, 9, 30), pd.Timestamp(2026, 11, 5)])
+sl = data.stock_archive_long(["01-October", "02-October", "03-October"], [["A", "5", "", "0"], ["SKU_ID", "x", "x", "x"], ["B", "1,200", None, "7"]], pd.Timestamp("2026-10-02"))
+ok("Stock Archive: blank cells are skipped (not zero), days after as-of are dropped, '1,200' reads as 1200",
+   len(sl) == 2 and set(sl["sku"]) == {"A", "B"} and sl[(sl.sku == "B")]["qty"].tolist() == [1200.0] and sl[(sl.sku == "A") & (sl.date == pd.Timestamp("2026-10-02"))].empty)
+
+# inbound before the panel starts reaches the buying-pattern features; nothing after the origin does
+ib = pd.DataFrame({"date": pd.to_datetime(["2025-12-01", "2026-01-05", "2026-01-20"]), "sku": ["S1", "S1", "S1"], "qty": [100, 50, 999]})
+hh = pd.DataFrame({"date": pd.date_range("2026-01-01", "2026-01-31"), "merchant": "m", "sku": "S1", "placed": 2.0, "confirmed": 1.0, "delivered": 1.0, "category": ""})
+Pi = data.build_panel(hh, None, None, None, None, as_of=pd.Timestamp("2026-01-31"), inbound=ib)
+oi = 9   # 10 Jan: the 20 Jan delivery is still in the future
+pf, since = purchase_features(Pi, oi, origin_info(Pi.dates, oi), 1)
+ok("buying pattern reads the Inbound sheet from before the first sales day (inbound since 2025-12-01, %d days earlier)" % Pi.inbh_off,
+   Pi.inbh_off == 31 and pf["inb_first_age"][0] == 31 + 9 and pf["inb_n365"][0] == 2 and since[0] == 5)
+ok("…and the 20 Jan delivery (after the origin) is not counted", pf["inb_n180"][0] == 2 and abs(pf["inb_buy_sell180"][0] - 150 / (10 + 10.0)) < 1e-9)
+P4 = make_panel(120, end="2026-10-30", seed=3)
+P4.INBH = np.concatenate([np.random.default_rng(1).integers(0, 3, (len(P4.skus), 60)) * 50.0, P4.INB], axis=1); P4.inbh_off = 60
+o4 = int((pd.Timestamp("2026-07-10") - P4.dates[0]).days)
+P5 = scrambled(P4, o4, seed=9); P5.INBH = P4.INBH.copy(); P5.INBH[:, 60 + o4 + 1:] = 777.0; P5.inbh_off = 60
+fa, _ = purchase_features(P4, o4, origin_info(P4.dates, o4), len(P4.skus)); fb, _ = purchase_features(P5, o4, origin_info(P5.dates, o4), len(P5.skus))
+ok("buying-pattern features unchanged when every inbound after the origin is scrambled", all(np.allclose(fa[k], fb[k], equal_nan=True) for k in fa))
+
+# stock now + the cap
+P6 = make_panel(50, end="2026-10-30", seed=4); P6.STK = np.full(P6.Q.shape, np.nan)
+o6 = int((pd.Timestamp("2026-09-15") - P6.dates[0]).days); P6.STK[:, o6 - 1] = 10.0
+inf6 = origin_info(P6.dates, o6)
+ok("stock now = the Stock Archive of the origin day or up to 3 days before (here the day before)", np.allclose(stock_now(P6, o6, inf6), 10.0))
+P6.STK[:, o6 - 1] = np.nan; P6.STK[:, o6 - 5] = 10.0
+ok("…an older archive day is not used (unknown, no cap)", np.isnan(stock_now(P6, o6, inf6)).all())
+infc = {"stock_now": np.array([10.0, 10.0, np.nan]), "since_inb_h": np.array([200.0, 30.0, 200.0])}
+capd = ENG.Engine.stock_cap({"x": np.array([100.0, 100.0, 100.0])}, infc)["x"]
+ok("stock cap: not bought for > %d days -> forecast <= %.1f x stock (100 -> 15); bought recently or stock unknown -> unchanged" % (ENG.CAP_NO_INBOUND_DAYS, ENG.CAP_STOCK_X),
+   capd.tolist() == [15.0, 100.0, 100.0])
+e6 = Engine(P6, fast=True); pr6, _, i6, _ = e6.predict_at(o6, 1, {})
+m6, st6 = Engine.cap_mask(i6)
+ok("the cap is applied to every candidate the engine produces", all((v[m6] <= st6[m6] * ENG.CAP_STOCK_X + 1e-9).all() for v in pr6.values()) if m6 is not None and m6.any() else True)
+
+# where the error comes from
+P7 = make_panel(150, end="2026-10-30", seed=6)
+P7.STK = np.where(np.random.default_rng(2).random(P7.Q.shape) < 0.2, 0.0, 50.0); P7.STK[:, :200] = np.nan
+e7 = Engine(P7, fast=True); bt7 = e7.backtest(1, buckets=["end"])
+es = pipeline.error_split(P7, bt7, e7)
+ok("error split: only months the Stock Archive covers, every class has n / actual / forecast / error, shares add up to 100",
+   es and all(pd.Period(r["month"], "M").start_time >= P7.dates[200] for r in es) and all(abs(sum(c["share"] for c in r["classes"].values()) - 100) < 0.6 for r in es)
+   and all(set(c) == {"n", "actual", "forecast", "error", "share"} for r in es for c in r["classes"].values()))
+ok("…and the classes are the documented ones", all(set(r["classes"]) <= set(pipeline.SPLIT_KEYS) for r in es))
+
 print("\n%d passed" % n_pass)
