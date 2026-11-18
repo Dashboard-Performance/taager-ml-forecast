@@ -1,4 +1,5 @@
 import sys, os, json, threading, http.server, io
+os.environ.setdefault("ML_DEEP", "0")        # the deep model has its own small test at the end; everything else runs without it (fast)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..")); sys.path.insert(0, os.path.dirname(__file__))
 import numpy as np, pandas as pd
 from synth import make_panel
@@ -239,5 +240,37 @@ ok("error split: only months the Stock Archive covers, every class has n / actua
    es and all(pd.Period(r["month"], "M").start_time >= P7.dates[200] for r in es) and all(abs(sum(c["share"] for c in r["classes"].values()) - 100) < 0.6 for r in es)
    and all(set(c) == {"n", "actual", "forecast", "error", "share"} for r in es for c in r["classes"].values()))
 ok("…and the classes are the documented ones", all(set(r["classes"]) <= set(pipeline.SPLIT_KEYS) for r in es))
+
+# ---- v2.3: the anchored scale, the fixed three-way merge, NHITS
+from forecast import deep
+from forecast.features import origin_info as _oi
+o8 = int((pd.Timestamp("2026-08-31") - P.dates[0]).days)
+df8, inf8 = build_features(P, o8)
+ok("next-month scale = the Forecast Model recipe's forecast (>= 1)", np.allclose(df8["scale_next"], np.maximum(1.0, df8["dash_rate"] / 30.0 * inf8["len_m"])))
+X1, s1 = Engine.design(df8, 1); X0, s0 = Engine.design(df8, 0)
+ok("…next-month models use it (also as the 'scale' feature); the current-month nowcast keeps the old scale", np.allclose(s1, df8["scale_next"]) and np.allclose(X1["scale"], df8["scale_next"]) and np.allclose(s0, df8["scale"]))
+e8 = Engine(P); e8._deep[o8] = np.full(len(P.skus), 40.0); e8.deep_origins = set(e8.deep_origins) | {o8}
+pr8, _, i8, _ = e8.predict_at(o8, 1, {})
+m8, st8 = Engine.cap_mask(i8); lim8 = np.where(m8, np.nan_to_num(st8) * ENG.CAP_STOCK_X, np.inf) if m8 is not None else np.inf
+al8 = df8["alive"].to_numpy()
+raw8 = (np.where(al8, pr8["dash"], 0) + pr8["ens"] + np.where(al8, 40.0, 0)) / 3.0
+ok("merge3 = (Forecast Model recipe + ensemble + NHITS) / 3 (then the stock cap)", np.allclose(pr8[ENG.FINAL], np.minimum(raw8, lim8), atol=1e-6) or np.allclose(pr8[ENG.FINAL][~(np.asarray(lim8) < raw8)], raw8[~(np.asarray(lim8) < raw8)]))
+e9 = Engine(P)
+ok("NHITS origins = month ends whose next month has finished (last %d) + today" % ENG.DEEP_BACKTEST_MONTHS,
+   len(e9.deep_origins) <= ENG.DEEP_BACKTEST_MONTHS + 1 and len(P.dates) - 1 in e9.deep_origins and all(
+       (lambda i: i["d"] == i["len_c"] and i["m_last"] <= P.dates[-1])(_oi(P.dates, o)) for o in e9.deep_origins if o != len(P.dates) - 1))
+pr9, *_ = Engine(P).predict_at(o8, 1, {})
+ok("without NHITS (switched off) merge3 = recipe + ensemble, and the forecast is published from it", ENG.FINAL in pr9 and "nhits" not in pr9)
+fa_, ia = deep.training_frame(P, o8); fb_, ib = deep.training_frame(scrambled(P, o8), o8)
+ok("NHITS training data ends on the origin day (identical when everything after it is scrambled)", fa_.equals(fb_) and (ia == ib).all() and fa_["ds"].max() == P.dates[o8])
+os.environ["ML_DEEP"] = "1"
+if deep.available():
+    os.environ["ML_DEEP_STEPS"] = "5"; deep.STEPS = 5
+    Ps = make_panel(40, end="2026-10-30", seed=11); os_ = int((pd.Timestamp("2026-09-30") - Ps.dates[0]).days)
+    f_ = deep.next_month(Ps, os_, _oi(Ps.dates, os_))
+    ok("NHITS runs and gives one non-negative number per SKU for the next month", f_ is not None and len(f_) == len(Ps.skus) and (f_ >= 0).all())
+else:
+    print("  (neuralforecast not installed here: NHITS run test skipped)")
+os.environ["ML_DEEP"] = "0"
 
 print("\n%d passed" % n_pass)

@@ -22,6 +22,8 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      # v2.3: NHITS needs PyTorch - the CPU build (small, no GPU drivers) first, then the rest
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -r requirements.txt
       # a model that fails its own tests never publishes
       - run: python tests/test_all.py

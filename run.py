@@ -13,7 +13,7 @@ def main():
     ap.add_argument("--worker"); ap.add_argument("--key"); ap.add_argument("--since", default="2026-01-01")
     ap.add_argument("--lock-month"); ap.add_argument("--out"); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--fast", action="store_true")
     ap.add_argument("--stock-file", help="(offline) Stock_Archive as a pickled DataFrame(sku, date, qty) or CSV with those columns")
-    ap.add_argument("--demo", action="store_true"); ap.add_argument("--from-file", help="ml-data.json.gz exported from the dashboard (offline run: nothing is fetched or sent)")
+    ap.add_argument("--no-2025", dest="no_2025", action="store_true", help="train on the 2026 history only"); ap.add_argument("--demo", action="store_true"); ap.add_argument("--from-file", help="ml-data.json.gz exported from the dashboard (offline run: nothing is fetched or sent)")
     a = ap.parse_args()
     from forecast import data, pipeline
     W = None
@@ -42,9 +42,13 @@ def main():
         except Exception as e: print("beginning inventory unavailable:", e); bi = None
         print("Worker sources ok: Main %d rows (%s .. %s), %d bundles mapped" % (len(newer), newer["date"].min().date(), newer["date"].max().date(), len(dmap)), flush=True)
         hist = data.fetch_history_long(pd.Timestamp(a.since), today)
+        h25 = None if a.no_2025 else data.fetch_history_2025()      # v2.3: 2025 too (more months to learn from)
+        if h25 is not None:
+            hist = pd.concat([h25[h25["date"] < pd.Timestamp(a.since)], hist], ignore_index=True)
+            print("2025 history: %d rows" % len(h25), flush=True)
         inbound = data.fetch_inbound(); prices = data.fetch_prices()
         stock = data.fetch_stock_archive(pd.Timestamp.now(tz="Africa/Cairo").tz_localize(None).normalize())
-        checks = {"overlap": data.overlap_check(hist, newer), "source": "Main + history tab", "prices": prices is not None, "inbound": inbound is not None, "beginInventory": bool(bi), "stockArchive": stock is not None and len(stock) > 0}
+        checks = {"overlap": data.overlap_check(hist, newer), "source": "Main + history tab" + (" + 2025 history" if h25 is not None else ""), "prices": prices is not None, "inbound": inbound is not None, "beginInventory": bool(bi), "stockArchive": stock is not None and len(stock) > 0}
         cairo_today = pd.Timestamp.now(tz="Africa/Cairo").tz_localize(None).normalize()
         dmax = max(x["date"].max() for x in (hist, newer) if x is not None and len(x))
         asof = data.pick_asof(cairo_today, dmax)

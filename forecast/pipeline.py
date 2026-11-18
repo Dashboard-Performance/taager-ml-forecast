@@ -30,8 +30,8 @@ def month_table(bt):
         rows = []
         for m, x in g.groupby("month"):
             r = {"month": m, "actual": _r1(x["y"].sum()), "n": int(len(x))}
-            for k in ("ens", "ens_cal", "gbm_l1", "gbm_l1_cal", "pace14", "naive"):
-                if k in x: r[k] = _r1(accuracy(x["y"], x[k])); r[k + "F"] = _r1(x[k].sum())
+            for k in ("merge3", "nhits", "dash", "ens", "ens_cal", "gbm_l1", "gbm_l1_cal", "pace14", "naive"):
+                if k in x and x[k].notna().all(): r[k] = _r1(accuracy(x["y"], x[k])); r[k + "F"] = _r1(x[k].sum())
             rows.append(r)
         out[str(b)] = sorted(rows, key=lambda r: r["month"])
     return out

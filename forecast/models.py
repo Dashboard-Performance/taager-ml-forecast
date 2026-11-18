@@ -11,7 +11,7 @@ from .features import FEATURES
 BASELINES = ["naive", "ma3", "pace14", "pace30", "pace_mtd", "dash"]   # "dash" = the Forecast Model's recipe (average of its recent-rate rules + TSB), see features.dash_rule_features
 GBMS = ["gbm_l1", "gbm_tw", "gbm_log"]
 BLENDS = ["blend", "blend_gbm"]   # 50 / 50 of the GBM ensemble (or the L1 GBM) and the Forecast Model recipe: two different ways of reading the same history, so their errors partly cancel
-CANDIDATES = BASELINES + GBMS + ["ens", "gbm_l1_cal", "ens_cal"] + BLENDS
+CANDIDATES = BASELINES + GBMS + ["ens", "gbm_l1_cal", "ens_cal"] + BLENDS + ["merge3"]   # v2.3: recipe + ensemble + NHITS (engine.FINAL)
 CAL_BASES = ("gbm_l1", "ens")
 PARAMS = dict(n_estimators=300, learning_rate=0.04, num_leaves=31, min_child_samples=40, subsample=0.8, subsample_freq=1,
               colsample_bytree=0.8, reg_lambda=1.0, random_state=7, n_jobs=2, verbose=-1, deterministic=True, force_row_wise=True)

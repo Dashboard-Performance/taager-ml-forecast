@@ -4,6 +4,7 @@ import pandas as pd
 
 from .features import FEATURES, build_features, category_codes, origin_info, segment, target_total
 from .models import (BASELINES, CAL_BASES, CANDIDATES, GBMS, accuracy, apply_band, band_quantiles, baselines, bias, fit, predict)
+from . import deep
 
 BUCKETS = [7, 14, 21, "end"]
 # v2.2 — stock cap (tested on Apr–Oct 2026): a SKU we have not bought for more than CAP_NO_INBOUND_DAYS cannot sell much more than the
@@ -11,6 +12,10 @@ BUCKETS = [7, 14, 21, "end"]
 CAP_NO_INBOUND_DAYS = 90
 CAP_STOCK_X = 1.5
 SEGS = ["A", "B", "C"]
+# v2.3 - the published forecast is FINAL for every segment: Forecast Model recipe + GBM ensemble + NHITS in equal parts (no champion switching:
+# picking a different winner every month from the months before scored 52-53%, the fixed merge 55.9% on Jul-Oct 2026).
+FINAL = "merge3"
+DEEP_BACKTEST_MONTHS = 4      # NHITS is trained for the live forecast and for the month-end forecasts of the last 4 finished months (scoring)
 
 
 class Engine:
@@ -20,6 +25,8 @@ class Engine:
         self.cc = category_codes(panel)
         self._feat = {}
         self.origins = self._origins()
+        self._deep = {}
+        self.deep_origins = self._deep_origins()
 
     # ---- origins
     def _origins(self):
@@ -33,6 +40,19 @@ class Engine:
                 if d == C.days_in_month and day != e: continue
                 out.append(int((day - self.dates[0]).days))
         return sorted(set(out))
+
+    def _deep_origins(self):
+        """month-end origins whose next month has finished (the last DEEP_BACKTEST_MONTHS of them) + today's origin"""
+        out, last = [], len(self.dates) - 1
+        for o in self.origins:
+            info = origin_info(self.dates, o)
+            if info["d"] == info["len_c"] and info["m_last"] <= self.dates[last]: out.append(o)
+        return set(out[-DEEP_BACKTEST_MONTHS:] + [last])
+
+    def deep_at(self, o, info):
+        if self.fast or o not in self.deep_origins: return None
+        if o not in self._deep: self._deep[o] = deep.next_month(self.p, o, info)
+        return self._deep[o]
 
     def feat(self, o):
         if o not in self._feat:
@@ -57,9 +77,19 @@ class Engine:
             y = target_total(self.p, s, e)
             if y is None: continue
             keep = df["alive"].to_numpy()
-            Xs.append(df.loc[keep, FEATURES]); ys.append(y[keep]); sc.append(df.loc[keep, "scale"].to_numpy()); months.add(str(s.to_period("M")))
+            X_, sc_ = self.design(df, offset, keep)
+            Xs.append(X_); ys.append(y[keep]); sc.append(sc_); months.add(str(s.to_period("M")))
         if not Xs: return None, None, None, 0
         return pd.concat(Xs, ignore_index=True), np.concatenate(ys), np.concatenate(sc), len(months)
+
+    @staticmethod
+    def design(df, offset, keep=None):
+        """(X, scale) for the models. v2.3: next month (offset 1) uses the Forecast Model recipe as its scale - also as the 'scale' feature."""
+        d = df if keep is None else df.loc[keep]
+        X = d[FEATURES]
+        if offset == 1 and "scale_next" in d:
+            X = X.assign(scale=d["scale_next"].to_numpy()); return X, d["scale_next"].to_numpy()
+        return X, d["scale"].to_numpy()
 
     def _models(self, o_f, offset, cache):
         # training depends only on which target months are already finished, so a whole month of origins shares one fit
@@ -81,13 +111,20 @@ class Engine:
         preds = dict(base)
         alive = df["alive"].to_numpy()
         if tm["models"]:
-            g = predict(tm["models"], df[FEATURES], df["scale"].to_numpy())
+            X_, sc_ = self.design(df, offset)
+            g = predict(tm["models"], X_, sc_)
             for k, v in g.items(): preds[k] = np.where(alive, v, 0.0)
         for k in BASELINES: preds[k] = np.where(alive, preds[k], 0.0)
         # blends: the GBM and the Forecast Model recipe read the history differently, so averaging them cancels part of each one's error
         if "ens" in preds: preds["blend"] = 0.5 * preds["ens"] + 0.5 * preds["dash"]
         if "gbm_l1" in preds: preds["blend_gbm"] = 0.5 * preds["gbm_l1"] + 0.5 * preds["dash"]
-        if offset == 1: preds = self.stock_cap(preds, info)
+        if offset == 1:
+            d = self.deep_at(o_f, info)
+            if d is not None: preds["nhits"] = np.where(alive, d, 0.0)
+            parts = [preds["dash"]] + [preds[k] for k in ("ens", "nhits") if k in preds]
+            if "ens" not in preds and "gbm_l1" in preds: parts.append(preds["gbm_l1"])
+            preds[FINAL] = np.mean(parts, axis=0)          # without NHITS (other days of the month / package missing): recipe + ensemble
+            preds = self.stock_cap(preds, info)
         return preds, df, info, tm
 
     @staticmethod
@@ -246,7 +283,8 @@ class Engine:
                         if len(gs): fac[seg == s_] = self.cal_factor(gs, base, str(info["M"]), self.cal_lag(b))
                     preds[base + "_cal"] = preds[base] * fac
             preds = self.stock_cap(preds, info)
-        champ = self.champions(bt, b); zq = self.bands(bt, b, champ)
+        champ = {s: FINAL for s in SEGS} if FINAL in preds else self.champions(bt, b)
+        zq = self.bands(bt, b, champ)
         f = np.zeros(len(df)); lo = np.zeros(len(df)); hi = np.zeros(len(df))
         for s in SEGS:
             idx = seg == s; k = champ[s] if champ[s] in preds else "ma3"

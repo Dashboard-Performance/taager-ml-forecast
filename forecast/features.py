@@ -343,6 +343,9 @@ def build_features(panel, o, cat_codes=None):
     pf, since_h = purchase_features(panel, o, info, S); f.update(pf)
     info["since_inb_h"] = since_h; info["stock_now"] = stock_now(panel, o, info)
     df = pd.DataFrame({k: f[k] for k in FEATURES})
+    # v2.3 - the NEXT-month models learn the correction of the Forecast Model recipe: their ratio target is y / (the recipe's forecast).
+    # Measured Jul-Oct 2026 (month-end forecast): L1 GBM 49.3% -> 51.4%, ensemble 48.8% -> 50.2%. The current-month nowcast keeps "scale".
+    df["scale_next"] = np.maximum(1.0, f["dash_rate"] / 30.0 * info["len_m"])
     df["alive"] = (cs[:, o + 1] - cs[:, max(o - 89, 0)]) > 0           # sold anything in the last 90 days
     return df, info
 

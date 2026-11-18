@@ -24,6 +24,10 @@ INBOUND_GID = "565878313"
 STOCK_ARCHIVE_GID = "1289659887"     # Stock_Archive: one row per SKU, one column per day ("23-August" ...), stock on hand that day — from 23 Aug 2026
 GID_DEBUNDLE = "1409034448"
 GID_PRODUCTS = "1779314157"
+# v2.3 - 2025 history (same columns as the history tab), its own spreadsheet. It must be viewable by link (Share -> Anyone with the link: Viewer),
+# like the main sheet, because the job reads it the same way (gviz). Measured: +3.8 points for the ML ensemble on Jul-Oct 2026.
+HIST2025_SHEET_ID = "1G1qrI0t6g6JGa_QqY9_syJOsqkL_oM7AgBJNWEbTuUs"
+HIST2025_GID = "1548115712"
 
 
 @dataclass
@@ -142,9 +146,10 @@ def main_long(text):
     return to_long(parse_table(text), "Main")
 
 
-def fetch_history_long(start, end):
+def fetch_history_long(start, end, sheet_id=SHEET_ID, gid=HISTORY_GID):
     """The history tab at merchant level (same grain as Main), one query per month."""
-    probe = _gviz(HISTORY_GID, "select * limit 1")
+    HISTORY_GID = gid
+    probe = _gviz(HISTORY_GID, "select * limit 1", sheet_id)
     labels = [(c.get("label") or c.get("id") or "").strip().upper() for c in probe["table"]["cols"]]
     need = ["PERIOD_FILTER", "TAGER_ID", "PRODUCT_ID", "CATEGORY", "PLACED_PIECES", "CONFIRMED_PIECES", "DELIVERED_PIECES"]
     if not set(need).issubset(labels):   # Google answers with the FIRST sheet when a gid does not exist - never train on the wrong tab
@@ -155,13 +160,23 @@ def fetch_history_long(start, end):
         a, b = m.start_time.strftime("%Y-%m-%d"), m.end_time.strftime("%Y-%m-%d")
         tq = ("select %(d)s, %(t)s, %(p)s, %(c)s, sum(%(pp)s), sum(%(cp)s), sum(%(dp)s) where %(d)s >= date '%(a)s' and %(d)s <= date '%(b)s' group by %(d)s, %(t)s, %(p)s, %(c)s"
               % {"d": L["PERIOD_FILTER"], "t": L["TAGER_ID"], "p": L["PRODUCT_ID"], "c": L["CATEGORY"], "pp": L["PLACED_PIECES"], "cp": L["CONFIRMED_PIECES"], "dp": L["DELIVERED_PIECES"], "a": a, "b": b})
-        for r in _gviz(HISTORY_GID, tq)["table"]["rows"]:
+        for r in _gviz(HISTORY_GID, tq, sheet_id)["table"]["rows"]:
             c = r["c"]
             if not c[0] or not c[2]: continue
             out.append((_gv_date(c[0]["v"]), str(c[1]["v"]).strip() if c[1] else "", str(c[2]["v"]).strip(), str((c[3] or {}).get("v") or "").strip().upper(),
                         (c[4] or {}).get("v") or 0, (c[5] or {}).get("v") or 0, (c[6] or {}).get("v") or 0))
     d = pd.DataFrame(out, columns=["date", "merchant", "sku", "category", "placed", "confirmed", "delivered"])
     return d[STD]
+
+
+def fetch_history_2025():
+    """2025 history (optional): None when the sheet cannot be read - the model then trains on 2026 only, as before."""
+    try:
+        d = fetch_history_long(pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31"), HIST2025_SHEET_ID, HIST2025_GID)
+        return d if len(d) else None
+    except BaseException as e:          # SystemExit from a wrong tab included: never stop the daily run for the optional year
+        print("2025 history unavailable (share the sheet 'Anyone with the link: Viewer'):", e)
+        return None
 
 
 def fetch_inbound():
